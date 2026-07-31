@@ -51,6 +51,20 @@ class AnnotationRepository @Inject constructor(
             )
         )
 
+    /** Saves a finger-drawn stroke as an ordered polyline of points (zero-area rects). */
+    suspend fun addDrawing(paperId: Long, page: Int, points: List<NormalizedRect>, color: Int): Long =
+        annotationDao.insert(
+            AnnotationEntity(
+                paperId = paperId,
+                page = page,
+                type = AnnotationType.DRAWING,
+                color = color,
+                geometryJson = json.encodeToString(points),
+                note = null,
+                createdAt = System.currentTimeMillis(),
+            )
+        )
+
     suspend fun addNote(paperId: Long, page: Int, anchor: NormalizedRect, color: Int, note: String): Long =
         annotationDao.insert(
             AnnotationEntity(

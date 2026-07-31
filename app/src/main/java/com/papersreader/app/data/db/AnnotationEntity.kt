@@ -5,7 +5,7 @@ import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
 
-enum class AnnotationType { HIGHLIGHT, NOTE }
+enum class AnnotationType { HIGHLIGHT, NOTE, DRAWING }
 
 @Entity(
     tableName = "annotations",
@@ -30,7 +30,8 @@ data class AnnotationEntity(
     /**
      * JSON array of normalized rects (0..1 relative to page width/height), e.g.
      * `[{"left":0.1,"top":0.2,"right":0.8,"bottom":0.25}]`. A NOTE uses a single zero-area
-     * rect as its pin location.
+     * rect as its pin location; a DRAWING reuses the same shape as an ordered polyline of
+     * zero-area rects (one per point along the finger-drawn stroke).
      */
     val geometryJson: String,
     val note: String? = null,

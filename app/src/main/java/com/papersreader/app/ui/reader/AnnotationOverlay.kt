@@ -13,38 +13,50 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.unit.IntSize
 import com.papersreader.app.data.db.AnnotationType
+import com.papersreader.app.data.pdf.InlineCitation
 import com.papersreader.app.data.repository.Annotation
 import com.papersreader.app.data.repository.NormalizedRect
 
 private const val NOTE_MARKER_RADIUS = 14f
+private const val DRAW_STROKE_WIDTH = 6f
 
 /**
- * Draws existing highlights/note markers over a rendered page and turns raw touch input into
- * new annotations depending on [mode]:
+ * Draws existing annotations, inline citation tap targets and search-match highlights over a
+ * rendered page, and turns raw touch input into new annotations depending on [mode]:
  *  - HIGHLIGHT: drag to draw a rectangle, released -> [onHighlightCreated].
  *  - NOTE: tap a spot -> [onNoteRequested] with that point.
- *  - VIEW: tap an existing annotation -> [onAnnotationTapped].
+ *  - DRAW: freehand finger drawing, released -> [onDrawingCreated].
+ *  - VIEW: tap a citation marker -> [onCitationTapped]; tap an existing annotation -> [onAnnotationTapped].
  */
 @Composable
 fun AnnotationOverlay(
     modifier: Modifier = Modifier,
     mode: ReaderMode,
     annotations: List<Annotation>,
-    pageSizePx: androidx.compose.ui.unit.IntSize,
+    pageSizePx: IntSize,
+    citations: List<InlineCitation> = emptyList(),
+    searchHighlights: List<NormalizedRect> = emptyList(),
+    activeSearchHighlight: NormalizedRect? = null,
     onHighlightCreated: (NormalizedRect) -> Unit,
     onNoteRequested: (NormalizedRect) -> Unit,
+    onDrawingCreated: (List<NormalizedRect>) -> Unit = {},
     onAnnotationTapped: (Annotation) -> Unit,
+    onCitationTapped: (InlineCitation) -> Unit = {},
 ) {
     var dragStart by remember(mode) { mutableStateOf<Offset?>(null) }
     var dragCurrent by remember(mode) { mutableStateOf<Offset?>(null) }
+    var drawPoints by remember(mode) { mutableStateOf<List<Offset>>(emptyList()) }
 
     Canvas(
         modifier = modifier
             .fillMaxSize()
-            .pointerInput(mode, pageSizePx) {
+            .pointerInput(mode, pageSizePx, citations, annotations) {
                 when (mode) {
                     ReaderMode.HIGHLIGHT -> detectDragGestures(
                         onDragStart = { offset ->
@@ -71,15 +83,40 @@ fun AnnotationOverlay(
                             onNoteRequested(pointToNormalizedAnchor(offset, pageSizePx))
                         }
                     }
+                    ReaderMode.DRAW -> detectDragGestures(
+                        onDragStart = { offset -> drawPoints = listOf(offset) },
+                        onDrag = { change, _ -> drawPoints = drawPoints + change.position },
+                        onDragEnd = {
+                            if (drawPoints.size >= 2 && pageSizePx.width > 0 && pageSizePx.height > 0) {
+                                onDrawingCreated(drawPoints.map { pointToNormalizedAnchor(it, pageSizePx) })
+                            }
+                            drawPoints = emptyList()
+                        },
+                        onDragCancel = { drawPoints = emptyList() },
+                    )
                     ReaderMode.VIEW -> detectTapGestures { offset ->
-                        val hit = annotations.lastOrNull { annotation ->
+                        val citationHit = citations.lastOrNull { denormalize(it.word.rect, pageSizePx).contains(offset) }
+                        if (citationHit != null) {
+                            onCitationTapped(citationHit)
+                            return@detectTapGestures
+                        }
+                        val annotationHit = annotations.lastOrNull { annotation ->
                             annotation.rects.any { rect -> denormalize(rect, pageSizePx).contains(offset) }
                         }
-                        hit?.let(onAnnotationTapped)
+                        annotationHit?.let(onAnnotationTapped)
                     }
                 }
             },
     ) {
+        searchHighlights.forEach { rect ->
+            val r = denormalize(rect, pageSizePx)
+            val isActive = rect == activeSearchHighlight
+            drawRect(
+                color = (if (isActive) Color(0xFFFF9800) else Color(0xFFFFEB3B)).copy(alpha = if (isActive) 0.6f else 0.4f),
+                topLeft = r.topLeft,
+                size = r.size,
+            )
+        }
         annotations.forEach { annotation ->
             drawAnnotation(annotation, pageSizePx)
         }
@@ -88,10 +125,13 @@ fun AnnotationOverlay(
         if (mode == ReaderMode.HIGHLIGHT && start != null && current != null) {
             drawDraftRect(start, current)
         }
+        if (mode == ReaderMode.DRAW && drawPoints.size >= 2) {
+            drawPath(pointsToPath(drawPoints), color = Color(0xFFE53935), style = Stroke(width = DRAW_STROKE_WIDTH))
+        }
     }
 }
 
-private fun DrawScope.drawAnnotation(annotation: Annotation, pageSizePx: androidx.compose.ui.unit.IntSize) {
+private fun DrawScope.drawAnnotation(annotation: Annotation, pageSizePx: IntSize) {
     val color = Color(annotation.color)
     when (annotation.type) {
         AnnotationType.HIGHLIGHT -> annotation.rects.forEach { rect ->
@@ -102,7 +142,16 @@ private fun DrawScope.drawAnnotation(annotation: Annotation, pageSizePx: android
             val r = denormalize(rect, pageSizePx)
             drawCircle(color = color, radius = NOTE_MARKER_RADIUS, center = r.topLeft)
         }
+        AnnotationType.DRAWING -> if (annotation.rects.size >= 2) {
+            val points = annotation.rects.map { denormalize(it, pageSizePx).topLeft }
+            drawPath(pointsToPath(points), color = color, style = Stroke(width = DRAW_STROKE_WIDTH))
+        }
     }
+}
+
+private fun pointsToPath(points: List<Offset>): Path = Path().apply {
+    points.firstOrNull()?.let { moveTo(it.x, it.y) }
+    points.drop(1).forEach { lineTo(it.x, it.y) }
 }
 
 private fun DrawScope.drawDraftRect(start: Offset, current: Offset) {
@@ -114,7 +163,7 @@ private fun DrawScope.drawDraftRect(start: Offset, current: Offset) {
     drawRect(color = Color(0xFFFFEB3B).copy(alpha = 0.45f), topLeft = topLeft, size = size)
 }
 
-private fun normalizedRect(a: Offset, b: Offset, pageSizePx: androidx.compose.ui.unit.IntSize): NormalizedRect {
+private fun normalizedRect(a: Offset, b: Offset, pageSizePx: IntSize): NormalizedRect {
     val left = minOf(a.x, b.x) / pageSizePx.width
     val top = minOf(a.y, b.y) / pageSizePx.height
     val right = maxOf(a.x, b.x) / pageSizePx.width
@@ -122,13 +171,13 @@ private fun normalizedRect(a: Offset, b: Offset, pageSizePx: androidx.compose.ui
     return NormalizedRect(left, top, right, bottom)
 }
 
-private fun pointToNormalizedAnchor(point: Offset, pageSizePx: androidx.compose.ui.unit.IntSize): NormalizedRect {
+private fun pointToNormalizedAnchor(point: Offset, pageSizePx: IntSize): NormalizedRect {
     val x = point.x / pageSizePx.width
     val y = point.y / pageSizePx.height
     return NormalizedRect(x, y, x, y)
 }
 
-private fun denormalize(rect: NormalizedRect, pageSizePx: androidx.compose.ui.unit.IntSize): Rect = Rect(
+private fun denormalize(rect: NormalizedRect, pageSizePx: IntSize): Rect = Rect(
     left = rect.left * pageSizePx.width,
     top = rect.top * pageSizePx.height,
     right = rect.right * pageSizePx.width,

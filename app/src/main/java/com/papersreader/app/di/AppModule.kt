@@ -5,6 +5,7 @@ import androidx.room.Room
 import com.papersreader.app.data.db.AnnotationDao
 import com.papersreader.app.data.db.AppDatabase
 import com.papersreader.app.data.db.BrowserTabDao
+import com.papersreader.app.data.db.MIGRATION_1_2
 import com.papersreader.app.data.db.PaperDao
 import com.papersreader.app.logging.FileLogTree
 import com.papersreader.app.logging.FileLogTreeHolder
@@ -26,7 +27,9 @@ object AppModule {
     @Provides
     @Singleton
     fun provideDatabase(@ApplicationContext context: Context): AppDatabase =
-        Room.databaseBuilder(context, AppDatabase::class.java, "papers-reader.db").build()
+        Room.databaseBuilder(context, AppDatabase::class.java, "papers-reader.db")
+            .addMigrations(MIGRATION_1_2)
+            .build()
 
     @Provides
     fun providePaperDao(db: AppDatabase): PaperDao = db.paperDao()

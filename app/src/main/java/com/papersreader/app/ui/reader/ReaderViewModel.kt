@@ -45,6 +45,20 @@ data class SearchState(
 
 data class PageSearchMatch(val page: Int, val match: SearchMatch)
 
+/** Marker colors offered for freehand drawing, in the order shown in the picker. */
+enum class MarkerColor(val argb: Int) {
+    BLACK(0xFF000000.toInt()),
+    RED(0xFFE53935.toInt()),
+    GREEN(0xFF2E7D32.toInt()),
+}
+
+/** Marker stroke widths offered for freehand drawing (raw canvas px, same scale as the old constant default). */
+enum class MarkerThickness(val px: Float) {
+    THIN(4f),
+    MEDIUM(8f),
+    THICK(14f),
+}
+
 data class ReaderUiState(
     val title: String = "",
     val pageCount: Int = 0,
@@ -57,6 +71,11 @@ data class ReaderUiState(
     val zoom: Float = 1f,
     val jumpToPage: Int? = null,
     val error: String? = null,
+    val markerColor: MarkerColor = MarkerColor.RED,
+    val markerThickness: MarkerThickness = MarkerThickness.MEDIUM,
+    val canUndoAnnotation: Boolean = false,
+    val downloadingReferenceIndex: Int? = null,
+    val libraryMessage: String? = null,
 )
 
 @HiltViewModel
@@ -80,14 +99,16 @@ class ReaderViewModel @Inject constructor(
     private val _searchState = MutableStateFlow(SearchState())
     val searchState: StateFlow<SearchState> = _searchState
 
-    /** Per-page word cache (for inline citations); populated lazily as pages become visible. */
-    private val pageWordsCache = HashMap<Int, List<PdfWord>>()
-    private val pageWordsRequested = HashSet<Int>()
+    /**
+     * Per-page word positions (for inline citations, and reused for search) — extracted for
+     * every page in a single pass on open. Originally this loaded words per-page on demand,
+     * but each call reopened the whole PDF from scratch; since the pager composes every page's
+     * words eagerly anyway, that meant re-parsing a 15-page document 15 times (~15s before the
+     * first citation became tappable). A single [PdfWordExtractor.extractAllPages] pass is both
+     * simpler and an order of magnitude faster.
+     */
     private val _pageWords = MutableStateFlow<Map<Int, List<PdfWord>>>(emptyMap())
     val pageWords: StateFlow<Map<Int, List<PdfWord>>> = _pageWords
-
-    /** Search runs across the whole document, so this cache is separate and filled once. */
-    private var allPageWordsCache: Map<Int, List<PdfWord>>? = null
 
     /**
      * All of the paper's annotations, not just the "current" page's — with continuous
@@ -118,6 +139,14 @@ class ReaderViewModel @Inject constructor(
 
             loadReferences(paperFile)
             loadOutline(paperFile)
+            loadAllPageWords(paperFile)
+        }
+    }
+
+    private fun loadAllPageWords(file: File) {
+        viewModelScope.launch {
+            val words = withContext(Dispatchers.Default) { PdfWordExtractor.extractAllPages(file) }
+            _pageWords.value = words
         }
     }
 
@@ -144,17 +173,6 @@ class ReaderViewModel @Inject constructor(
     suspend fun pageAspectRatio(pageIndex: Int): Float =
         runCatching { renderer?.pageAspectRatio(pageIndex) }.getOrNull() ?: (1f / 1.414f)
 
-    /** Lazily extracts and caches word positions for [pageIndex], used for inline citations. */
-    fun ensurePageWordsLoaded(pageIndex: Int) {
-        if (!pageWordsRequested.add(pageIndex)) return
-        val currentFile = file ?: return
-        viewModelScope.launch(Dispatchers.Default) {
-            val words = runCatching { PdfWordExtractor.extractWords(currentFile, pageIndex) }.getOrDefault(emptyList())
-            pageWordsCache[pageIndex] = words
-            _pageWords.value = pageWordsCache.toMap()
-        }
-    }
-
     fun onPageChanged(page: Int) {
         _uiState.value = _uiState.value.copy(currentPage = page)
         currentPageFlow.value = page
@@ -177,25 +195,55 @@ class ReaderViewModel @Inject constructor(
         _uiState.value = _uiState.value.copy(mode = mode)
     }
 
+    fun setMarkerColor(color: MarkerColor) {
+        _uiState.value = _uiState.value.copy(markerColor = color)
+    }
+
+    fun setMarkerThickness(thickness: MarkerThickness) {
+        _uiState.value = _uiState.value.copy(markerThickness = thickness)
+    }
+
+    /** Only the single most recent annotation is undoable, cleared once anything else happens. */
+    private var lastCreatedAnnotationId: Long? = null
+
+    private fun rememberForUndo(id: Long) {
+        lastCreatedAnnotationId = id
+        _uiState.value = _uiState.value.copy(canUndoAnnotation = true)
+    }
+
+    fun undoLastAnnotation() {
+        val id = lastCreatedAnnotationId ?: return
+        lastCreatedAnnotationId = null
+        _uiState.value = _uiState.value.copy(canUndoAnnotation = false)
+        viewModelScope.launch { annotationRepository.deleteById(id) }
+    }
+
     fun addHighlight(page: Int, rect: NormalizedRect, color: Int) {
         viewModelScope.launch {
-            annotationRepository.addHighlight(paperId, page, listOf(rect), color)
+            rememberForUndo(annotationRepository.addHighlight(paperId, page, listOf(rect), color))
         }
     }
 
     fun addNote(page: Int, anchor: NormalizedRect, color: Int, text: String) {
         viewModelScope.launch {
-            annotationRepository.addNote(paperId, page, anchor, color, text)
+            rememberForUndo(annotationRepository.addNote(paperId, page, anchor, color, text))
         }
     }
 
-    fun addDrawing(page: Int, points: List<NormalizedRect>, color: Int) {
+    fun addDrawing(page: Int, points: List<NormalizedRect>) {
+        val state = _uiState.value
         viewModelScope.launch {
-            annotationRepository.addDrawing(paperId, page, points, color)
+            rememberForUndo(
+                annotationRepository.addDrawing(paperId, page, points, state.markerColor.argb, state.markerThickness.px)
+            )
         }
     }
 
     fun deleteAnnotation(annotation: Annotation) {
+        if (annotation.id == lastCreatedAnnotationId) {
+            lastCreatedAnnotationId = null
+            _uiState.value = _uiState.value.copy(canUndoAnnotation = false)
+        }
         viewModelScope.launch { annotationRepository.delete(annotation) }
     }
 
@@ -214,10 +262,51 @@ class ReaderViewModel @Inject constructor(
         }
     }
 
-    /** An inline "[12]" tap jumps to (and briefly opens) the matching reference, like Scholar PDF Reader. */
-    fun referenceForCitation(citation: InlineCitation): ParsedReference? {
-        val index = citation.referenceIndices.firstOrNull() ?: return null
-        return _uiState.value.references.getOrNull(index - 1)
+    /**
+     * An inline "[12]" (or "[3, 7]", "[4-6]") tap resolves every referenced entry, like Scholar
+     * PDF Reader — a citation dialog decides whether to show one reference directly or a list
+     * to choose from, based on how many indices this marker actually grouped together.
+     */
+    fun referencesForCitation(citation: InlineCitation): List<ParsedReference> =
+        citation.referenceIndices.mapNotNull { index -> _uiState.value.references.getOrNull(index - 1) }
+
+    fun dismissLibraryMessage() {
+        _uiState.value = _uiState.value.copy(libraryMessage = null)
+    }
+
+    /**
+     * One-click "download this reference straight into the library" — only succeeds when the
+     * resolved link is (or can be turned into, e.g. an arXiv /abs/ page) a directly downloadable
+     * open-access PDF; paywalled publisher pages fail here and the caller should fall back to
+     * opening the browser tab instead, same as a normal reference tap.
+     */
+    fun downloadReferenceToLibrary(reference: ParsedReference, onOpenedInBrowser: () -> Unit) {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(downloadingReferenceIndex = reference.index)
+            val target = referenceRepository.resolveTarget(reference.text)
+            val bytes = referenceRepository.tryDownloadOpenAccessPdf(target.url)
+            if (bytes != null) {
+                val result = libraryRepository.importFromBytes(
+                    bytes,
+                    suggestedFallbackName = target.resolvedTitle ?: reference.text.take(80),
+                    sourceUrl = target.url,
+                )
+                _uiState.value = _uiState.value.copy(
+                    downloadingReferenceIndex = null,
+                    libraryMessage = result.fold(
+                        onSuccess = { "Saved to library" },
+                        onFailure = { "Download succeeded but import failed: ${it.message}" },
+                    ),
+                )
+            } else {
+                _uiState.value = _uiState.value.copy(
+                    downloadingReferenceIndex = null,
+                    libraryMessage = "No direct PDF available — opening in browser",
+                )
+                browserTabRepository.openNewTab(target.url, target.resolvedTitle)
+                onOpenedInBrowser()
+            }
+        }
     }
 
     // --- Search -------------------------------------------------------------------------
@@ -241,9 +330,12 @@ class ReaderViewModel @Inject constructor(
         val currentFile = file ?: return
         viewModelScope.launch {
             _searchState.value = _searchState.value.copy(loading = true)
-            val wordsByPage = allPageWordsCache ?: withContext(Dispatchers.Default) {
-                PdfWordExtractor.extractAllPages(currentFile)
-            }.also { allPageWordsCache = it }
+            // Shares the same cache inline citations use; only re-extracts if search is
+            // triggered before the initial load (kicked off in open()) has finished.
+            val wordsByPage = _pageWords.value.ifEmpty {
+                withContext(Dispatchers.Default) { PdfWordExtractor.extractAllPages(currentFile) }
+                    .also { _pageWords.value = it }
+            }
 
             val options = _searchState.value
             val results = withContext(Dispatchers.Default) {

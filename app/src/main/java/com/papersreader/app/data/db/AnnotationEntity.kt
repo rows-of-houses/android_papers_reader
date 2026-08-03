@@ -36,4 +36,6 @@ data class AnnotationEntity(
     val geometryJson: String,
     val note: String? = null,
     val createdAt: Long,
+    /** Stroke width in dp, DRAWING only; null means "use the default" (older rows, other types). */
+    val strokeWidth: Float? = null,
 )

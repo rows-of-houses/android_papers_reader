@@ -3,6 +3,7 @@ package com.papersreader.app.ui.reader
 import android.graphics.Bitmap
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -36,6 +37,8 @@ import androidx.compose.material.icons.filled.LibraryBooks
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.NoteAdd
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Undo
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -46,27 +49,33 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
@@ -85,7 +94,10 @@ import kotlinx.coroutines.launch
 
 private val highlightColor = androidx.compose.ui.graphics.Color(0xFFFFEB3B).toArgb()
 private val noteColor = androidx.compose.ui.graphics.Color(0xFF2196F3).toArgb()
-private val drawColor = androidx.compose.ui.graphics.Color(0xFFE53935).toArgb()
+
+/** Edge band (from the left screen edge) that arms the swipe-to-open-outline gesture. */
+private val EDGE_SWIPE_BAND = 24.dp
+private val EDGE_SWIPE_THRESHOLD = 56.dp
 
 /** Render pages a bit sharper than the screen so pinch-zoom stays reasonably crisp. */
 private const val RENDER_SCALE_FACTOR = 2
@@ -115,9 +127,18 @@ fun ReaderScreen(
     var inspectedCitation by remember { mutableStateOf<InlineCitation?>(null) }
 
     val listState = rememberLazyListState()
+    val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
 
     var zoom by remember { mutableStateOf(1f) }
     var panX by remember { mutableStateOf(0f) }
+
+    LaunchedEffect(uiState.libraryMessage) {
+        uiState.libraryMessage?.let { message ->
+            snackbarHostState.showSnackbar(message)
+            viewModel.dismissLibraryMessage()
+        }
+    }
 
     // Track which page is mostly at the top of the viewport as the "current" page.
     LaunchedEffect(listState) {
@@ -182,24 +203,77 @@ fun ReaderScreen(
                 )
             }
         },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
-            AnnotationModeBar(mode = uiState.mode, onModeSelected = viewModel::setMode)
+            Column {
+                if (uiState.mode == ReaderMode.DRAW) {
+                    MarkerPickerBar(
+                        color = uiState.markerColor,
+                        thickness = uiState.markerThickness,
+                        onColorSelected = viewModel::setMarkerColor,
+                        onThicknessSelected = viewModel::setMarkerThickness,
+                    )
+                }
+                AnnotationModeBar(
+                    mode = uiState.mode,
+                    canUndo = uiState.canUndoAnnotation,
+                    onModeSelected = viewModel::setMode,
+                    onUndo = viewModel::undoLastAnnotation,
+                )
+            }
         },
     ) { padding ->
         Box(modifier = Modifier.fillMaxSize().padding(padding)) {
             if (uiState.pageCount == 0) {
                 CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
             } else {
+                val view = androidx.compose.ui.platform.LocalView.current
+                val edgeDensity = LocalDensity.current
+                val edgeSwipeArmed = uiState.mode == ReaderMode.VIEW && uiState.outline.isNotEmpty()
+                var columnHeightPx by remember { mutableStateOf(0) }
+
+                // The left-edge swipe lives in exactly the same screen region gesture-nav
+                // Android reserves for "swipe from edge to go back", which wins the gesture
+                // arbitration by default and eats the touch before our pointerInput ever sees
+                // it. Explicitly excluding that strip from system gesture handling is the
+                // documented way apps opt back into edge touches (used by drawing/game apps).
+                DisposableEffect(edgeSwipeArmed, columnHeightPx) {
+                    if (edgeSwipeArmed && columnHeightPx > 0) {
+                        val edgeBandPx = with(edgeDensity) { EDGE_SWIPE_BAND.roundToPx() }
+                        view.systemGestureExclusionRects = listOf(android.graphics.Rect(0, 0, edgeBandPx, columnHeightPx))
+                    }
+                    onDispose { view.systemGestureExclusionRects = emptyList() }
+                }
+
                 LazyColumn(
                     state = listState,
                     userScrollEnabled = uiState.mode == ReaderMode.VIEW,
                     modifier = Modifier
                         .fillMaxSize()
+                        .onSizeChanged { columnHeightPx = it.height }
                         .pointerInput(uiState.mode) {
                             if (uiState.mode != ReaderMode.VIEW) return@pointerInput
                             detectPinchZoom { pan, gestureZoom ->
                                 zoom = (zoom * gestureZoom).coerceIn(1f, 5f)
-                                panX = if (zoom <= 1f) 0f else panX + pan.x
+                                val newMaxPanX = size.width * (zoom - 1) / 2f
+                                panX = if (zoom <= 1f) 0f else (panX + pan.x).coerceIn(-newMaxPanX, newMaxPanX)
+                            }
+                        }
+                        .pointerInput(uiState.mode) {
+                            // A single finger pans horizontally once zoomed in, same gesture a
+                            // vertical scroll would use — deliberately never consumed so
+                            // LazyColumn's own scroll keeps working at the same time (see
+                            // detectPinchZoom's doc comment for why consuming breaks that).
+                            if (uiState.mode != ReaderMode.VIEW) return@pointerInput
+                            detectSingleFingerHorizontalPan(isPannable = { zoom > 1f }) { dx ->
+                                val bound = size.width * (zoom - 1) / 2f
+                                panX = (panX + dx).coerceIn(-bound, bound)
+                            }
+                        }
+                        .pointerInput(uiState.mode, uiState.outline.isNotEmpty()) {
+                            if (uiState.mode != ReaderMode.VIEW || uiState.outline.isEmpty()) return@pointerInput
+                            detectLeftEdgeSwipe(edgeBand = EDGE_SWIPE_BAND.toPx(), threshold = EDGE_SWIPE_THRESHOLD.toPx()) {
+                                showOutline = true
                             }
                         }
                         .graphicsLayer(scaleX = zoom, scaleY = zoom, translationX = panX),
@@ -214,12 +288,13 @@ fun ReaderScreen(
                                 .filter { it.page == pageIndex }
                                 .flatMap { it.match.words.map(PdfWord::rect) },
                             activeSearchHighlight = if (searchState.matches.getOrNull(searchState.currentMatchIndex)?.page == pageIndex) activeSearchHighlight else null,
+                            drawColor = Color(uiState.markerColor.argb),
+                            drawStrokeWidth = uiState.markerThickness.px,
                             renderPage = viewModel::renderPage,
                             pageAspectRatio = viewModel::pageAspectRatio,
-                            onWordsNeeded = { viewModel.ensurePageWordsLoaded(pageIndex) },
                             onHighlightCreated = { rect -> viewModel.addHighlight(pageIndex, rect, highlightColor) },
                             onNoteRequested = { anchor -> noteDialogAnchor = PendingNote(pageIndex, anchor) },
-                            onDrawingCreated = { points -> viewModel.addDrawing(pageIndex, points, drawColor) },
+                            onDrawingCreated = { points -> viewModel.addDrawing(pageIndex, points) },
                             onAnnotationTapped = { annotation -> inspectedAnnotation = annotation },
                             onCitationTapped = { citation -> inspectedCitation = citation },
                         )
@@ -237,9 +312,16 @@ fun ReaderScreen(
         ReferencesSheet(
             references = uiState.references,
             loading = uiState.referencesLoading,
+            downloadingReferenceIndex = uiState.downloadingReferenceIndex,
             onReferenceClick = { ref ->
                 showReferences = false
                 viewModel.openReference(ref, onOpened = onOpenInBrowser)
+            },
+            onDownloadClick = { ref ->
+                viewModel.downloadReferenceToLibrary(ref) {
+                    showReferences = false
+                    onOpenInBrowser()
+                }
             },
             onDismiss = { showReferences = false },
         )
@@ -278,13 +360,13 @@ fun ReaderScreen(
     }
 
     inspectedCitation?.let { citation ->
-        val reference = viewModel.referenceForCitation(citation)
+        val references = viewModel.referencesForCitation(citation)
         CitationDialog(
             citation = citation,
-            reference = reference,
-            onOpen = {
+            references = references,
+            onOpen = { reference ->
                 inspectedCitation = null
-                reference?.let { viewModel.openReference(it, onOpened = onOpenInBrowser) }
+                viewModel.openReference(reference, onOpened = onOpenInBrowser)
             },
             onDismiss = { inspectedCitation = null },
         )
@@ -292,7 +374,12 @@ fun ReaderScreen(
 }
 
 @Composable
-private fun AnnotationModeBar(mode: ReaderMode, onModeSelected: (ReaderMode) -> Unit) {
+private fun AnnotationModeBar(
+    mode: ReaderMode,
+    canUndo: Boolean,
+    onModeSelected: (ReaderMode) -> Unit,
+    onUndo: () -> Unit,
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -312,6 +399,65 @@ private fun AnnotationModeBar(mode: ReaderMode, onModeSelected: (ReaderMode) -> 
             checked = mode == ReaderMode.DRAW,
             onCheckedChange = { onModeSelected(if (it) ReaderMode.DRAW else ReaderMode.VIEW) },
         ) { Icon(Icons.Filled.Draw, contentDescription = "Draw mode") }
+        IconButton(onClick = onUndo, enabled = canUndo) {
+            Icon(Icons.Filled.Undo, contentDescription = "Undo last annotation")
+        }
+    }
+}
+
+@Composable
+private fun MarkerPickerBar(
+    color: MarkerColor,
+    thickness: MarkerThickness,
+    onColorSelected: (MarkerColor) -> Unit,
+    onThicknessSelected: (MarkerThickness) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            MarkerColor.entries.forEach { candidate ->
+                Box(
+                    modifier = Modifier
+                        .padding(end = 10.dp)
+                        .size(28.dp)
+                        .background(Color(candidate.argb), shape = androidx.compose.foundation.shape.CircleShape)
+                        .then(
+                            if (candidate == color) {
+                                Modifier.border(3.dp, MaterialTheme.colorScheme.primary, androidx.compose.foundation.shape.CircleShape)
+                            } else Modifier,
+                        )
+                        .clickable { onColorSelected(candidate) },
+                )
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            MarkerThickness.entries.forEach { candidate ->
+                val selected = candidate == thickness
+                Box(
+                    modifier = Modifier
+                        .padding(end = 8.dp)
+                        .size(36.dp)
+                        .background(
+                            if (selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+                            shape = RoundedCornerShape(8.dp),
+                        )
+                        .clickable { onThicknessSelected(candidate) },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(width = 20.dp, height = (candidate.px / 2).dp)
+                            .background(MaterialTheme.colorScheme.onSurface, shape = RoundedCornerShape(50)),
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -323,9 +469,10 @@ private fun PageContent(
     words: List<PdfWord>,
     searchHighlights: List<NormalizedRect>,
     activeSearchHighlight: NormalizedRect?,
+    drawColor: Color,
+    drawStrokeWidth: Float,
     renderPage: suspend (Int, Int) -> Bitmap?,
     pageAspectRatio: suspend (Int) -> Float,
-    onWordsNeeded: () -> Unit,
     onHighlightCreated: (NormalizedRect) -> Unit,
     onNoteRequested: (NormalizedRect) -> Unit,
     onDrawingCreated: (List<NormalizedRect>) -> Unit,
@@ -341,7 +488,6 @@ private fun PageContent(
         if (containerWidth <= 0) return@LaunchedEffect
         if (aspectRatio == null) aspectRatio = pageAspectRatio(pageIndex)
         bitmap = renderPage(pageIndex, containerWidth * RENDER_SCALE_FACTOR)
-        onWordsNeeded()
     }
 
     val density = LocalDensity.current
@@ -381,6 +527,8 @@ private fun PageContent(
                 citations = citations,
                 searchHighlights = searchHighlights,
                 activeSearchHighlight = activeSearchHighlight,
+                drawColor = drawColor,
+                drawStrokeWidth = drawStrokeWidth,
                 onHighlightCreated = onHighlightCreated,
                 onNoteRequested = onNoteRequested,
                 onDrawingCreated = onDrawingCreated,
@@ -477,13 +625,39 @@ private fun OutlineSheet(outline: List<OutlineEntry>, onEntryClick: (OutlineEntr
 }
 
 @Composable
-private fun CitationDialog(citation: InlineCitation, reference: ParsedReference?, onOpen: () -> Unit, onDismiss: () -> Unit) {
+private fun CitationDialog(
+    citation: InlineCitation,
+    references: List<ParsedReference>,
+    onOpen: (ParsedReference) -> Unit,
+    onDismiss: () -> Unit,
+) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Reference ${citation.referenceIndices.joinToString(", ")}") },
-        text = { Text(reference?.text ?: "Couldn't find this reference in the bibliography.") },
+        text = {
+            when {
+                references.isEmpty() -> Text("Couldn't find this reference in the bibliography.")
+                references.size == 1 -> Text(references.first().text)
+                // A grouped marker like "[3, 7]" or "[4-6]" — list every entry so the user can
+                // pick which one they actually meant, instead of silently opening only the first.
+                else -> LazyColumn(modifier = Modifier.heightIn(max = 320.dp)) {
+                    items(references, key = { it.index }) { ref ->
+                        Text(
+                            "${ref.index}. ${ref.text}",
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onOpen(ref) }
+                                .padding(vertical = 8.dp),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                }
+            }
+        },
         confirmButton = {
-            TextButton(onClick = onOpen, enabled = reference != null) { Text("Open") }
+            if (references.size == 1) {
+                TextButton(onClick = { onOpen(references.first()) }) { Text("Open") }
+            }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
     )
@@ -494,7 +668,9 @@ private fun CitationDialog(citation: InlineCitation, reference: ParsedReference?
 private fun ReferencesSheet(
     references: List<ParsedReference>,
     loading: Boolean,
+    downloadingReferenceIndex: Int?,
     onReferenceClick: (ParsedReference) -> Unit,
+    onDownloadClick: (ParsedReference) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState()
@@ -502,7 +678,8 @@ private fun ReferencesSheet(
         Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
             Text("References", style = MaterialTheme.typography.titleLarge)
             Text(
-                "Tap a reference to look it up and open it in a new browser tab.",
+                "Tap a reference to open it in a new browser tab, or tap the download icon to " +
+                    "save an open-access PDF (e.g. arXiv) straight to your library.",
                 style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.padding(bottom = 8.dp),
             )
@@ -511,14 +688,26 @@ private fun ReferencesSheet(
                 references.isEmpty() -> Text("No reference list detected in this PDF.")
                 else -> LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 400.dp)) {
                     items(references, key = { it.index }) { ref ->
-                        Text(
-                            "${ref.index}. ${ref.text}",
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onReferenceClick(ref) }
-                                .padding(vertical = 8.dp),
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "${ref.index}. ${ref.text}",
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { onReferenceClick(ref) }
+                                    .padding(vertical = 8.dp),
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            if (downloadingReferenceIndex == ref.index) {
+                                CircularProgressIndicator(modifier = Modifier.size(24.dp).padding(8.dp))
+                            } else {
+                                IconButton(onClick = { onDownloadClick(ref) }) {
+                                    Icon(Icons.Filled.Download, contentDescription = "Download to library")
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -584,5 +773,55 @@ private suspend fun PointerInputScope.detectPinchZoom(onGesture: (pan: Offset, z
                 }
             }
         } while (event.changes.any { it.pressed })
+    }
+}
+
+/**
+ * Single-finger horizontal panning, active only while [isPannable] (zoomed in). Deliberately
+ * never calls [androidx.compose.ui.input.pointer.PointerInputChange.consume] — same reasoning
+ * as [detectPinchZoom] above: LazyColumn's own scrollable modifier reads the very same raw
+ * pointer stream for vertical scrolling, and only stops working if something else consumes it
+ * first. Left un-consumed, both run off the same drag simultaneously, giving free diagonal pan.
+ */
+private suspend fun PointerInputScope.detectSingleFingerHorizontalPan(isPannable: () -> Boolean, onPanX: (Float) -> Unit) {
+    awaitEachGesture {
+        awaitFirstDown(requireUnconsumed = false)
+        do {
+            val event = awaitPointerEvent()
+            if (event.changes.size == 1 && isPannable()) {
+                val change = event.changes[0]
+                val dx = change.positionChange().x
+                if (dx != 0f) onPanX(dx)
+            }
+        } while (event.changes.any { it.pressed })
+    }
+}
+
+/**
+ * Recognizes a left-to-right drag starting within [edgeBand] of the left screen edge (like a
+ * navigation-drawer swipe) and fires [onOpen] once the horizontal distance clears [threshold]
+ * and clearly dominates over vertical movement. Touches that start outside the edge band are
+ * ignored immediately so ordinary vertical scrolling anywhere else on the page is untouched.
+ */
+private suspend fun PointerInputScope.detectLeftEdgeSwipe(edgeBand: Float, threshold: Float, onOpen: () -> Unit) {
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false)
+        if (down.position.x > edgeBand) return@awaitEachGesture
+        var totalDx = 0f
+        var totalDy = 0f
+        do {
+            val event = awaitPointerEvent()
+            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+            if (!change.pressed) break
+            val delta = change.positionChange()
+            totalDx += delta.x
+            totalDy += delta.y
+            if (totalDx > threshold && totalDx > kotlin.math.abs(totalDy) * 1.5f) {
+                onOpen()
+                change.consume()
+                break
+            }
+            if (kotlin.math.abs(totalDy) > threshold) break
+        } while (change.pressed)
     }
 }

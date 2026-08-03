@@ -25,6 +25,7 @@ data class Annotation(
     val rects: List<NormalizedRect>,
     val note: String?,
     val createdAt: Long,
+    val strokeWidth: Float? = null,
 )
 
 @Singleton
@@ -52,7 +53,7 @@ class AnnotationRepository @Inject constructor(
         )
 
     /** Saves a finger-drawn stroke as an ordered polyline of points (zero-area rects). */
-    suspend fun addDrawing(paperId: Long, page: Int, points: List<NormalizedRect>, color: Int): Long =
+    suspend fun addDrawing(paperId: Long, page: Int, points: List<NormalizedRect>, color: Int, strokeWidth: Float): Long =
         annotationDao.insert(
             AnnotationEntity(
                 paperId = paperId,
@@ -62,6 +63,7 @@ class AnnotationRepository @Inject constructor(
                 geometryJson = json.encodeToString(points),
                 note = null,
                 createdAt = System.currentTimeMillis(),
+                strokeWidth = strokeWidth,
             )
         )
 
@@ -77,6 +79,8 @@ class AnnotationRepository @Inject constructor(
                 createdAt = System.currentTimeMillis(),
             )
         )
+
+    suspend fun deleteById(id: Long) = annotationDao.deleteById(id)
 
     suspend fun delete(annotation: Annotation) = annotationDao.delete(
         AnnotationEntity(
@@ -115,6 +119,7 @@ class AnnotationRepository @Inject constructor(
                 rects = runCatching { json.decodeFromString<List<NormalizedRect>>(entity.geometryJson) }.getOrDefault(emptyList()),
                 note = entity.note,
                 createdAt = entity.createdAt,
+                strokeWidth = entity.strokeWidth,
             )
         }
 }

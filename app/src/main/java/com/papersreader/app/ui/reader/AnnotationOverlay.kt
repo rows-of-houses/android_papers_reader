@@ -43,6 +43,8 @@ fun AnnotationOverlay(
     citations: List<InlineCitation> = emptyList(),
     searchHighlights: List<NormalizedRect> = emptyList(),
     activeSearchHighlight: NormalizedRect? = null,
+    drawColor: Color = Color(0xFFE53935),
+    drawStrokeWidth: Float = DRAW_STROKE_WIDTH,
     onHighlightCreated: (NormalizedRect) -> Unit,
     onNoteRequested: (NormalizedRect) -> Unit,
     onDrawingCreated: (List<NormalizedRect>) -> Unit = {},
@@ -126,7 +128,7 @@ fun AnnotationOverlay(
             drawDraftRect(start, current)
         }
         if (mode == ReaderMode.DRAW && drawPoints.size >= 2) {
-            drawPath(pointsToPath(drawPoints), color = Color(0xFFE53935), style = Stroke(width = DRAW_STROKE_WIDTH))
+            drawPath(pointsToPath(drawPoints), color = drawColor, style = Stroke(width = drawStrokeWidth))
         }
     }
 }
@@ -144,7 +146,7 @@ private fun DrawScope.drawAnnotation(annotation: Annotation, pageSizePx: IntSize
         }
         AnnotationType.DRAWING -> if (annotation.rects.size >= 2) {
             val points = annotation.rects.map { denormalize(it, pageSizePx).topLeft }
-            drawPath(pointsToPath(points), color = color, style = Stroke(width = DRAW_STROKE_WIDTH))
+            drawPath(pointsToPath(points), color = color, style = Stroke(width = annotation.strokeWidth ?: DRAW_STROKE_WIDTH))
         }
     }
 }

@@ -5,6 +5,5 @@ sealed class Screen(val route: String) {
     data object Reader : Screen("reader/{paperId}") {
         fun route(paperId: Long) = "reader/$paperId"
     }
-    data object Browser : Screen("browser")
     data object Logs : Screen("logs")
 }

@@ -14,7 +14,6 @@ import com.papersreader.app.data.pdf.PdfWordExtractor
 import com.papersreader.app.data.pdf.SearchMatch
 import com.papersreader.app.data.repository.Annotation
 import com.papersreader.app.data.repository.AnnotationRepository
-import com.papersreader.app.data.repository.BrowserTabRepository
 import com.papersreader.app.data.repository.LibraryRepository
 import com.papersreader.app.data.repository.NormalizedRect
 import com.papersreader.app.data.repository.ReferenceRepository
@@ -83,7 +82,6 @@ class ReaderViewModel @Inject constructor(
     private val libraryRepository: LibraryRepository,
     private val annotationRepository: AnnotationRepository,
     private val referenceRepository: ReferenceRepository,
-    private val browserTabRepository: BrowserTabRepository,
 ) : ViewModel() {
 
     private var renderer: PdfPageRenderer? = null
@@ -251,14 +249,13 @@ class ReaderViewModel @Inject constructor(
         viewModelScope.launch { annotationRepository.updateNoteText(annotation, text) }
     }
 
-    /** Resolves a tapped reference and opens it as a new browser tab; returns true once opened. */
-    fun openReference(reference: ParsedReference, onOpened: () -> Unit) {
+    /** Resolves a tapped reference to its URL; the caller launches it in the system browser. */
+    fun openReference(reference: ParsedReference, onResolved: (url: String) -> Unit) {
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(resolvingReference = true)
             val target = referenceRepository.resolveTarget(reference.text)
-            browserTabRepository.openNewTab(target.url, target.resolvedTitle)
             _uiState.value = _uiState.value.copy(resolvingReference = false)
-            onOpened()
+            onResolved(target.url)
         }
     }
 
@@ -277,21 +274,22 @@ class ReaderViewModel @Inject constructor(
     /**
      * One-click "download this reference straight into the library" — only succeeds when the
      * resolved link is (or can be turned into, e.g. an arXiv /abs/ page) a directly downloadable
-     * open-access PDF; paywalled publisher pages fail here and the caller should fall back to
-     * opening the browser tab instead, same as a normal reference tap.
+     * open-access PDF. Deliberately does *not* open a browser tab on failure — the user opted
+     * into a silent download, not a navigation, so a failure just reports why via
+     * [ReaderUiState.libraryMessage]; they can still tap "Open" separately if they want the page.
      */
-    fun downloadReferenceToLibrary(reference: ParsedReference, onOpenedInBrowser: () -> Unit) {
+    fun downloadReferenceToLibrary(reference: ParsedReference) {
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(downloadingReferenceIndex = reference.index)
             val target = referenceRepository.resolveTarget(reference.text)
             val bytes = referenceRepository.tryDownloadOpenAccessPdf(target.url)
-            if (bytes != null) {
+            _uiState.value = if (bytes != null) {
                 val result = libraryRepository.importFromBytes(
                     bytes,
                     suggestedFallbackName = target.resolvedTitle ?: reference.text.take(80),
                     sourceUrl = target.url,
                 )
-                _uiState.value = _uiState.value.copy(
+                _uiState.value.copy(
                     downloadingReferenceIndex = null,
                     libraryMessage = result.fold(
                         onSuccess = { "Saved to library" },
@@ -299,12 +297,10 @@ class ReaderViewModel @Inject constructor(
                     ),
                 )
             } else {
-                _uiState.value = _uiState.value.copy(
+                _uiState.value.copy(
                     downloadingReferenceIndex = null,
-                    libraryMessage = "No direct PDF available — opening in browser",
+                    libraryMessage = "No open-access PDF found for this reference — tap Open to view it online instead",
                 )
-                browserTabRepository.openNewTab(target.url, target.resolvedTitle)
-                onOpenedInBrowser()
             }
         }
     }

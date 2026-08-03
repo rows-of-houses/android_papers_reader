@@ -57,7 +57,6 @@ import androidx.compose.material3.TextField
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -95,10 +94,6 @@ import kotlinx.coroutines.launch
 private val highlightColor = androidx.compose.ui.graphics.Color(0xFFFFEB3B).toArgb()
 private val noteColor = androidx.compose.ui.graphics.Color(0xFF2196F3).toArgb()
 
-/** Edge band (from the left screen edge) that arms the swipe-to-open-outline gesture. */
-private val EDGE_SWIPE_BAND = 24.dp
-private val EDGE_SWIPE_THRESHOLD = 56.dp
-
 /** Render pages a bit sharper than the screen so pinch-zoom stays reasonably crisp. */
 private const val RENDER_SCALE_FACTOR = 2
 
@@ -109,10 +104,16 @@ private data class PendingNote(val page: Int, val anchor: NormalizedRect)
 fun ReaderScreen(
     paperId: Long,
     onBack: () -> Unit,
-    onOpenInBrowser: () -> Unit,
     viewModel: ReaderViewModel = hiltViewModel(),
 ) {
     LaunchedEffect(paperId) { viewModel.open(paperId) }
+
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val openInSystemBrowser: (String) -> Unit = { url ->
+        runCatching {
+            context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+        }
+    }
 
     val uiState by viewModel.uiState.collectAsState()
     val paperAnnotations by viewModel.paperAnnotations.collectAsState()
@@ -132,6 +133,7 @@ fun ReaderScreen(
 
     var zoom by remember { mutableStateOf(1f) }
     var panX by remember { mutableStateOf(0f) }
+    var panY by remember { mutableStateOf(0f) }
 
     LaunchedEffect(uiState.libraryMessage) {
         uiState.libraryMessage?.let { message ->
@@ -150,6 +152,7 @@ fun ReaderScreen(
         uiState.jumpToPage?.let { page ->
             zoom = 1f
             panX = 0f
+            panY = 0f
             listState.animateScrollToItem(page)
             viewModel.consumeJumpToPage()
         }
@@ -227,56 +230,50 @@ fun ReaderScreen(
             if (uiState.pageCount == 0) {
                 CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
             } else {
-                val view = androidx.compose.ui.platform.LocalView.current
-                val edgeDensity = LocalDensity.current
-                val edgeSwipeArmed = uiState.mode == ReaderMode.VIEW && uiState.outline.isNotEmpty()
-                var columnHeightPx by remember { mutableStateOf(0) }
-
-                // The left-edge swipe lives in exactly the same screen region gesture-nav
-                // Android reserves for "swipe from edge to go back", which wins the gesture
-                // arbitration by default and eats the touch before our pointerInput ever sees
-                // it. Explicitly excluding that strip from system gesture handling is the
-                // documented way apps opt back into edge touches (used by drawing/game apps).
-                DisposableEffect(edgeSwipeArmed, columnHeightPx) {
-                    if (edgeSwipeArmed && columnHeightPx > 0) {
-                        val edgeBandPx = with(edgeDensity) { EDGE_SWIPE_BAND.roundToPx() }
-                        view.systemGestureExclusionRects = listOf(android.graphics.Rect(0, 0, edgeBandPx, columnHeightPx))
-                    }
-                    onDispose { view.systemGestureExclusionRects = emptyList() }
-                }
-
+                // The list only handles its own scroll at 1x; once zoomed in, panning (both
+                // pinch-drag and single-finger) takes over so it can move freely in both axes
+                // like pinch-zooming a webpage, instead of fighting the list's vertical-only
+                // native scroll.
+                val zoomed = zoom > 1f
                 LazyColumn(
                     state = listState,
-                    userScrollEnabled = uiState.mode == ReaderMode.VIEW,
+                    userScrollEnabled = uiState.mode == ReaderMode.VIEW && !zoomed,
                     modifier = Modifier
                         .fillMaxSize()
-                        .onSizeChanged { columnHeightPx = it.height }
                         .pointerInput(uiState.mode) {
                             if (uiState.mode != ReaderMode.VIEW) return@pointerInput
                             detectPinchZoom { pan, gestureZoom ->
                                 zoom = (zoom * gestureZoom).coerceIn(1f, 5f)
-                                val newMaxPanX = size.width * (zoom - 1) / 2f
-                                panX = if (zoom <= 1f) 0f else (panX + pan.x).coerceIn(-newMaxPanX, newMaxPanX)
+                                val maxPanX = size.width * (zoom - 1) / 2f
+                                val maxPanY = size.height * (zoom - 1) / 2f
+                                panX = if (zoom <= 1f) 0f else (panX + pan.x).coerceIn(-maxPanX, maxPanX)
+                                panY = if (zoom <= 1f) 0f else (panY + pan.y).coerceIn(-maxPanY, maxPanY)
                             }
                         }
                         .pointerInput(uiState.mode) {
-                            // A single finger pans horizontally once zoomed in, same gesture a
-                            // vertical scroll would use — deliberately never consumed so
-                            // LazyColumn's own scroll keeps working at the same time (see
-                            // detectPinchZoom's doc comment for why consuming breaks that).
+                            // Free 2D pan once zoomed in, deliberately never consumed so the
+                            // pinch detector above keeps working at the same time (see its doc
+                            // comment for why consuming single-finger events breaks that).
+                            // Horizontal panning simply clamps at the page edge — there's
+                            // nowhere else for it to go — but vertical panning hands any
+                            // overflow past its local budget off to the list's own scroll via
+                            // dispatchRawDelta, so dragging past what a single zoomed viewport
+                            // can show keeps scrolling into the next page instead of just
+                            // stopping ("hitting a wall") while still visually mid-document.
                             if (uiState.mode != ReaderMode.VIEW) return@pointerInput
-                            detectSingleFingerHorizontalPan(isPannable = { zoom > 1f }) { dx ->
-                                val bound = size.width * (zoom - 1) / 2f
-                                panX = (panX + dx).coerceIn(-bound, bound)
+                            detectSingleFingerFreePan(isPannable = { zoom > 1f }) { dx, dy ->
+                                val maxPanX = size.width * (zoom - 1) / 2f
+                                panX = (panX + dx).coerceIn(-maxPanX, maxPanX)
+
+                                val maxPanY = size.height * (zoom - 1) / 2f
+                                val target = panY + dy
+                                val clamped = target.coerceIn(-maxPanY, maxPanY)
+                                val leftover = target - clamped
+                                panY = clamped
+                                if (leftover != 0f) listState.dispatchRawDelta(-leftover / zoom)
                             }
                         }
-                        .pointerInput(uiState.mode, uiState.outline.isNotEmpty()) {
-                            if (uiState.mode != ReaderMode.VIEW || uiState.outline.isEmpty()) return@pointerInput
-                            detectLeftEdgeSwipe(edgeBand = EDGE_SWIPE_BAND.toPx(), threshold = EDGE_SWIPE_THRESHOLD.toPx()) {
-                                showOutline = true
-                            }
-                        }
-                        .graphicsLayer(scaleX = zoom, scaleY = zoom, translationX = panX),
+                        .graphicsLayer(scaleX = zoom, scaleY = zoom, translationX = panX, translationY = panY),
                 ) {
                     items(uiState.pageCount, key = { it }) { pageIndex ->
                         PageContent(
@@ -315,14 +312,9 @@ fun ReaderScreen(
             downloadingReferenceIndex = uiState.downloadingReferenceIndex,
             onReferenceClick = { ref ->
                 showReferences = false
-                viewModel.openReference(ref, onOpened = onOpenInBrowser)
+                viewModel.openReference(ref, onResolved = openInSystemBrowser)
             },
-            onDownloadClick = { ref ->
-                viewModel.downloadReferenceToLibrary(ref) {
-                    showReferences = false
-                    onOpenInBrowser()
-                }
-            },
+            onDownloadClick = { ref -> viewModel.downloadReferenceToLibrary(ref) },
             onDismiss = { showReferences = false },
         )
     }
@@ -364,10 +356,12 @@ fun ReaderScreen(
         CitationDialog(
             citation = citation,
             references = references,
+            downloadingReferenceIndex = uiState.downloadingReferenceIndex,
             onOpen = { reference ->
                 inspectedCitation = null
-                viewModel.openReference(reference, onOpened = onOpenInBrowser)
+                viewModel.openReference(reference, onResolved = openInSystemBrowser)
             },
+            onDownload = { reference -> viewModel.downloadReferenceToLibrary(reference) },
             onDismiss = { inspectedCitation = null },
         )
     }
@@ -628,7 +622,9 @@ private fun OutlineSheet(outline: List<OutlineEntry>, onEntryClick: (OutlineEntr
 private fun CitationDialog(
     citation: InlineCitation,
     references: List<ParsedReference>,
+    downloadingReferenceIndex: Int?,
     onOpen: (ParsedReference) -> Unit,
+    onDownload: (ParsedReference) -> Unit,
     onDismiss: () -> Unit,
 ) {
     AlertDialog(
@@ -642,21 +638,38 @@ private fun CitationDialog(
                 // pick which one they actually meant, instead of silently opening only the first.
                 else -> LazyColumn(modifier = Modifier.heightIn(max = 320.dp)) {
                     items(references, key = { it.index }) { ref ->
-                        Text(
-                            "${ref.index}. ${ref.text}",
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onOpen(ref) }
-                                .padding(vertical = 8.dp),
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                "${ref.index}. ${ref.text}",
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { onOpen(ref) }
+                                    .padding(vertical = 8.dp),
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            if (downloadingReferenceIndex == ref.index) {
+                                CircularProgressIndicator(modifier = Modifier.size(20.dp).padding(8.dp))
+                            } else {
+                                IconButton(onClick = { onDownload(ref) }) {
+                                    Icon(Icons.Filled.Download, contentDescription = "Download to library")
+                                }
+                            }
+                        }
                     }
                 }
             }
         },
         confirmButton = {
             if (references.size == 1) {
-                TextButton(onClick = { onOpen(references.first()) }) { Text("Open") }
+                val ref = references.first()
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (downloadingReferenceIndex == ref.index) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp).padding(end = 12.dp))
+                    } else {
+                        TextButton(onClick = { onDownload(ref) }) { Text("Download") }
+                    }
+                    TextButton(onClick = { onOpen(ref) }) { Text("Open") }
+                }
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
@@ -777,51 +790,22 @@ private suspend fun PointerInputScope.detectPinchZoom(onGesture: (pan: Offset, z
 }
 
 /**
- * Single-finger horizontal panning, active only while [isPannable] (zoomed in). Deliberately
- * never calls [androidx.compose.ui.input.pointer.PointerInputChange.consume] — same reasoning
- * as [detectPinchZoom] above: LazyColumn's own scrollable modifier reads the very same raw
- * pointer stream for vertical scrolling, and only stops working if something else consumes it
- * first. Left un-consumed, both run off the same drag simultaneously, giving free diagonal pan.
+ * Single-finger 2D panning, active only while [isPannable] (zoomed in). Deliberately never
+ * calls [androidx.compose.ui.input.pointer.PointerInputChange.consume] — same reasoning as
+ * [detectPinchZoom] above: LazyColumn's own scrollable modifier reads the very same raw pointer
+ * stream for vertical scrolling, and only stops working if something else consumes it first.
+ * Left un-consumed, both run off the same drag simultaneously, giving free diagonal pan.
  */
-private suspend fun PointerInputScope.detectSingleFingerHorizontalPan(isPannable: () -> Boolean, onPanX: (Float) -> Unit) {
+private suspend fun PointerInputScope.detectSingleFingerFreePan(isPannable: () -> Boolean, onPan: (dx: Float, dy: Float) -> Unit) {
     awaitEachGesture {
         awaitFirstDown(requireUnconsumed = false)
         do {
             val event = awaitPointerEvent()
             if (event.changes.size == 1 && isPannable()) {
                 val change = event.changes[0]
-                val dx = change.positionChange().x
-                if (dx != 0f) onPanX(dx)
+                val delta = change.positionChange()
+                if (delta.x != 0f || delta.y != 0f) onPan(delta.x, delta.y)
             }
         } while (event.changes.any { it.pressed })
-    }
-}
-
-/**
- * Recognizes a left-to-right drag starting within [edgeBand] of the left screen edge (like a
- * navigation-drawer swipe) and fires [onOpen] once the horizontal distance clears [threshold]
- * and clearly dominates over vertical movement. Touches that start outside the edge band are
- * ignored immediately so ordinary vertical scrolling anywhere else on the page is untouched.
- */
-private suspend fun PointerInputScope.detectLeftEdgeSwipe(edgeBand: Float, threshold: Float, onOpen: () -> Unit) {
-    awaitEachGesture {
-        val down = awaitFirstDown(requireUnconsumed = false)
-        if (down.position.x > edgeBand) return@awaitEachGesture
-        var totalDx = 0f
-        var totalDy = 0f
-        do {
-            val event = awaitPointerEvent()
-            val change = event.changes.firstOrNull { it.id == down.id } ?: break
-            if (!change.pressed) break
-            val delta = change.positionChange()
-            totalDx += delta.x
-            totalDy += delta.y
-            if (totalDx > threshold && totalDx > kotlin.math.abs(totalDy) * 1.5f) {
-                onOpen()
-                change.consume()
-                break
-            }
-            if (kotlin.math.abs(totalDy) > threshold) break
-        } while (change.pressed)
     }
 }

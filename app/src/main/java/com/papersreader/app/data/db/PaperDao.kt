@@ -27,8 +27,8 @@ interface PaperDao {
     @Delete
     suspend fun delete(paper: PaperEntity)
 
-    @Query("UPDATE papers SET lastPage = :page, lastOpenedAt = :openedAt WHERE id = :id")
-    suspend fun updateReadingPosition(id: Long, page: Int, openedAt: Long)
+    @Query("UPDATE papers SET lastPage = :page, lastZoom = :zoom, lastOpenedAt = :openedAt WHERE id = :id")
+    suspend fun updateReadingPosition(id: Long, page: Int, zoom: Float, openedAt: Long)
 
     @Query("SELECT * FROM papers WHERE fileName = :fileName LIMIT 1")
     suspend fun findByFileName(fileName: String): PaperEntity?

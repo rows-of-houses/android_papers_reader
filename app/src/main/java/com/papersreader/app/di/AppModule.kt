@@ -6,6 +6,7 @@ import com.papersreader.app.data.db.AnnotationDao
 import com.papersreader.app.data.db.AppDatabase
 import com.papersreader.app.data.db.MIGRATION_1_2
 import com.papersreader.app.data.db.MIGRATION_2_3
+import com.papersreader.app.data.db.MIGRATION_3_4
 import com.papersreader.app.data.db.PaperDao
 import com.papersreader.app.logging.FileLogTree
 import com.papersreader.app.logging.FileLogTreeHolder
@@ -28,7 +29,7 @@ object AppModule {
     @Singleton
     fun provideDatabase(@ApplicationContext context: Context): AppDatabase =
         Room.databaseBuilder(context, AppDatabase::class.java, "papers-reader.db")
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
             .build()
 
     @Provides

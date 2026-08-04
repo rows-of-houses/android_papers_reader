@@ -24,8 +24,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
@@ -58,6 +58,7 @@ import androidx.compose.material3.TextField
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -91,6 +92,7 @@ import com.papersreader.app.data.pdf.ParsedReference
 import com.papersreader.app.data.pdf.PdfWord
 import com.papersreader.app.data.repository.Annotation
 import com.papersreader.app.data.repository.NormalizedRect
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private val highlightColor = androidx.compose.ui.graphics.Color(0xFFFFEB3B).toArgb()
@@ -130,7 +132,15 @@ fun ReaderScreen(
     var inspectedAnnotation by remember { mutableStateOf<Annotation?>(null) }
     var inspectedCitation by remember { mutableStateOf<InlineCitation?>(null) }
 
-    val listState = rememberLazyListState()
+    // Built with the paper's last-read page baked in as its *initial* index (re-keyed once
+    // pageCount actually arrives, so the first real composition of this list already starts
+    // there) rather than created empty and scrolled to position afterwards — that gives the
+    // retry loop below a head start, though it alone isn't enough to land exactly on the target;
+    // see that loop's comment for why.
+    val listState = remember(uiState.pageCount > 0) {
+        val target = if (uiState.pageCount > 0) uiState.currentPage.coerceIn(0, uiState.pageCount - 1) else 0
+        LazyListState(firstVisibleItemIndex = target)
+    }
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
@@ -158,8 +168,47 @@ fun ReaderScreen(
 
     // Track which page is mostly at the top of the viewport as the "current" page.
     LaunchedEffect(listState) {
+        // Each page's height only settles once its own aspect ratio has loaded (a separate
+        // suspend call per page, resolved as that item gets composed) — a lazily-composed page
+        // this list hasn't reached yet still reports a tiny placeholder height (just its loading
+        // spinner) until then. A single scrollToItem() called right after this list first
+        // appears can therefore only jump as far as whatever placeholder-sized heights are known
+        // *at that instant*, landing well short of the real target. Retrying gives each
+        // still-loading skipped page a chance to report its real height before the next attempt,
+        // converging on the true target instead of silently settling wherever that first,
+        // premature jump happened to land.
+        val target = uiState.currentPage.coerceIn(0, maxOf(uiState.pageCount - 1, 0))
+        var attempts = 0
+        while (listState.firstVisibleItemIndex < target && attempts < 40) {
+            listState.scrollToItem(target)
+            attempts++
+            if (listState.firstVisibleItemIndex < target) delay(100)
+        }
         snapshotFlow { listState.firstVisibleItemIndex }
-            .collect { page -> if (page != uiState.currentPage) viewModel.onPageChanged(page) }
+            .collect { page -> if (page != uiState.currentPage) viewModel.onPageChanged(page, zoom) }
+    }
+
+    // Restore the zoom the paper was last closed at, once the document has actually loaded.
+    // (The initial *page* is instead baked into `listState`'s construction above — see its
+    // comment for why a post-hoc scrollToItem() here didn't work.) Guarded so it only runs once
+    // per paper, not on every later pageCount change.
+    var restoredInitialZoom by remember(paperId) { mutableStateOf(false) }
+    LaunchedEffect(uiState.pageCount) {
+        if (uiState.pageCount > 0 && !restoredInitialZoom) {
+            restoredInitialZoom = true
+            zoom = uiState.initialZoom.coerceIn(1f, 5f)
+        }
+    }
+
+    // Zoom can change without the visible page ever changing (e.g. pinch-zoom then leave) —
+    // capture the final state on the way out so it isn't lost. Keyed on `listState` itself
+    // (not just paperId): `listState` is *recreated* once pageCount arrives (see its own
+    // comment above), and a DisposableEffect keyed only on the never-changing paperId would
+    // keep referencing whichever `listState` object was in scope the very first time it ran —
+    // the short-lived placeholder from before the document loaded, permanently stuck at index
+    // 0 — instead of the real one the LazyColumn actually scrolls.
+    DisposableEffect(listState) {
+        onDispose { viewModel.saveReadingState(listState.firstVisibleItemIndex, zoom) }
     }
 
     LaunchedEffect(uiState.jumpToPage) {
@@ -663,16 +712,18 @@ private fun CitationDialog(
     onDownload: (ParsedReference) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    // Deliberately the exact same row shape regardless of how many references this marker
+    // grouped together (even just one) — tap the text to open it, tap the icon to download it.
+    // A single-reference marker used to get its own special pair of Open/Download buttons
+    // instead, which meant the interaction differed depending on the marker you happened to tap.
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Reference ${citation.referenceIndices.joinToString(", ")}") },
         text = {
-            when {
-                references.isEmpty() -> Text("Couldn't find this reference in the bibliography.")
-                references.size == 1 -> Text(references.first().text)
-                // A grouped marker like "[3, 7]" or "[4-6]" — list every entry so the user can
-                // pick which one they actually meant, instead of silently opening only the first.
-                else -> LazyColumn(modifier = Modifier.heightIn(max = 320.dp)) {
+            if (references.isEmpty()) {
+                Text("Couldn't find this reference in the bibliography.")
+            } else {
+                LazyColumn(modifier = Modifier.heightIn(max = 320.dp)) {
                     items(references, key = { it.index }) { ref ->
                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                             Text(
@@ -695,19 +746,7 @@ private fun CitationDialog(
                 }
             }
         },
-        confirmButton = {
-            if (references.size == 1) {
-                val ref = references.first()
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (downloadingReferenceIndex == ref.index) {
-                        CircularProgressIndicator(modifier = Modifier.size(20.dp).padding(end = 12.dp))
-                    } else {
-                        TextButton(onClick = { onDownload(ref) }) { Text("Download") }
-                    }
-                    TextButton(onClick = { onOpen(ref) }) { Text("Open") }
-                }
-            }
-        },
+        confirmButton = {},
         dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
     )
 }
@@ -727,8 +766,8 @@ private fun ReferencesSheet(
         Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
             Text("References", style = MaterialTheme.typography.titleLarge)
             Text(
-                "Tap a reference to open it in a new browser tab, or tap the download icon to " +
-                    "save an open-access PDF (e.g. arXiv) straight to your library.",
+                "Tap a reference to open it in your browser, or tap the download icon to save an " +
+                    "open-access PDF straight to your library and read it right away.",
                 style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.padding(bottom = 8.dp),
             )

@@ -90,10 +90,28 @@ class InlineCitationDetectorTest {
     }
 
     @Test
-    fun `does not merge a bracket group across a line break`() {
+    fun `merges a bracket group that wraps across a real line break in a narrow column`() {
+        // Real-world case that broke tapping: "...as face, hand detection [37, 29,\n15, 31, 14,
+        // 36]." — a long group in a narrow (two-column) layout wraps its closing bracket onto
+        // the line below the opening one.
+        val words = listOf(
+            word("[37,", left = 0.20f, top = 0.50f, bottom = 0.52f),
+            word("29,", left = 0.24f, top = 0.50f, bottom = 0.52f),
+            word("15,", left = 0.05f, top = 0.535f, bottom = 0.555f), // wraps to the next line
+            word("31,", left = 0.09f, top = 0.535f, bottom = 0.555f),
+            word("14,", left = 0.13f, top = 0.535f, bottom = 0.555f),
+            word("36].", left = 0.17f, top = 0.535f, bottom = 0.555f),
+        )
+        val citations = InlineCitationDetector.detect(words)
+        assertEquals(1, citations.size)
+        assertEquals(listOf(37, 29, 15, 31, 14, 36), citations[0].referenceIndices)
+    }
+
+    @Test
+    fun `does not merge a bracket group across an unrelated far-away line`() {
         val words = listOf(
             word("[38,", left = 0.20f, top = 0.50f, bottom = 0.52f),
-            word("24,", left = 0.24f, top = 0.55f, bottom = 0.57f), // next line down
+            word("24,", left = 0.20f, top = 0.62f, bottom = 0.64f), // several lines further down
         )
         assertTrue(InlineCitationDetector.detect(words).isEmpty())
     }

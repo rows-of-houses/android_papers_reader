@@ -11,6 +11,7 @@ import com.papersreader.app.data.pdf.PdfOutlineExtractor
 import com.papersreader.app.data.pdf.PdfPageRenderer
 import com.papersreader.app.data.pdf.PdfWord
 import com.papersreader.app.data.pdf.PdfWordExtractor
+import com.papersreader.app.data.pdf.ReferenceTitleGuesser
 import com.papersreader.app.data.pdf.SearchMatch
 import com.papersreader.app.data.repository.Annotation
 import com.papersreader.app.data.repository.AnnotationRepository
@@ -67,7 +68,8 @@ data class ReaderUiState(
     val referencesLoading: Boolean = false,
     val resolvingReference: Boolean = false,
     val outline: List<OutlineEntry> = emptyList(),
-    val zoom: Float = 1f,
+    /** Zoom the paper was last closed at, applied once when the reader first opens it. */
+    val initialZoom: Float = 1f,
     val jumpToPage: Int? = null,
     val error: String? = null,
     val markerColor: MarkerColor = MarkerColor.RED,
@@ -127,7 +129,11 @@ class ReaderViewModel @Inject constructor(
                 _uiState.value = _uiState.value.copy(error = "Paper not found")
                 return@launch
             }
-            _uiState.value = _uiState.value.copy(title = paper.title, currentPage = paper.lastPage)
+            _uiState.value = _uiState.value.copy(
+                title = paper.title,
+                currentPage = paper.lastPage,
+                initialZoom = paper.lastZoom,
+            )
             currentPageFlow.value = paper.lastPage
 
             val paperFile = libraryRepository.paperFile(paper)
@@ -172,14 +178,16 @@ class ReaderViewModel @Inject constructor(
     suspend fun pageAspectRatio(pageIndex: Int): Float =
         runCatching { renderer?.pageAspectRatio(pageIndex) }.getOrNull() ?: (1f / 1.414f)
 
-    fun onPageChanged(page: Int) {
+    /** Persists the current page + zoom so the reader reopens exactly where it was left off. */
+    fun onPageChanged(page: Int, zoom: Float) {
         _uiState.value = _uiState.value.copy(currentPage = page)
         currentPageFlow.value = page
-        viewModelScope.launch { libraryRepository.updateReadingPosition(paperId, page) }
+        viewModelScope.launch { libraryRepository.updateReadingPosition(paperId, page, zoom) }
     }
 
-    fun setZoom(zoom: Float) {
-        _uiState.value = _uiState.value.copy(zoom = zoom.coerceIn(1f, 5f))
+    /** Same persistence as [onPageChanged], without touching the (already-correct) current-page state — used when leaving the reader to also capture a zoom change made without scrolling to a new page. */
+    fun saveReadingState(page: Int, zoom: Float) {
+        viewModelScope.launch { libraryRepository.updateReadingPosition(paperId, page, zoom) }
     }
 
     fun jumpToPage(page: Int) {
@@ -291,7 +299,8 @@ class ReaderViewModel @Inject constructor(
             val target = referenceRepository.resolveTarget(reference.text)
             val bytes = referenceRepository.tryDownloadOpenAccessPdf(
                 url = target.url,
-                fallbackTitle = target.resolvedTitle ?: reference.text.take(200),
+                doi = target.doi,
+                fallbackTitle = target.resolvedTitle ?: ReferenceTitleGuesser.guessTitle(reference.text).take(200),
             )
             _uiState.value = if (bytes != null) {
                 val result = libraryRepository.importFromBytes(

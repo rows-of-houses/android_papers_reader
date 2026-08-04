@@ -85,7 +85,7 @@ class LibraryRepository @Inject constructor(
         paperDao.delete(paper)
     }
 
-    suspend fun updateReadingPosition(paperId: Long, page: Int) = withContext(Dispatchers.IO) {
-        paperDao.updateReadingPosition(paperId, page, System.currentTimeMillis())
+    suspend fun updateReadingPosition(paperId: Long, page: Int, zoom: Float) = withContext(Dispatchers.IO) {
+        paperDao.updateReadingPosition(paperId, page, zoom, System.currentTimeMillis())
     }
 }

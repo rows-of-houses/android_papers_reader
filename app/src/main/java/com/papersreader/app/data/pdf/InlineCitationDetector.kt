@@ -52,17 +52,32 @@ object InlineCitationDetector {
     private fun mergeBracketGroup(words: List<PdfWord>, startIndex: Int): Pair<InlineCitation, Int>? {
         val builder = StringBuilder(words[startIndex].text)
         var rect = words[startIndex].rect
+        // Compared against for line-adjacency/gluing on the *next* step — the accumulated `rect`
+        // above grows to span every merged word, so once a group has wrapped onto a second line
+        // its height would otherwise look like "one giant line" and throw off both the same-line
+        // glue check and the next-line tolerance for word 3+.
+        var lastWordRect = words[startIndex].rect
         var j = startIndex + 1
         while (j < words.size && j - startIndex < MAX_MERGE_WORDS) {
             val next = words[j]
-            if (!verticallyOverlaps(rect, next.rect)) return null
+            val sameLine = verticallyOverlaps(lastWordRect, next.rect)
+            // A long group like "[37, 29, 15, 31, 14, 36]" can wrap across a real line break in
+            // narrow (e.g. two-column) layouts — the closing "]" ends up on the line below the
+            // opening "[". Content-stream order (which this word list is already in — see
+            // PdfWordExtractor/memory notes on why sortByPosition breaks 2-column PDFs) keeps
+            // column-adjacent words together, so trusting "next word in list order, one line
+            // below" doesn't risk jumping into an unrelated column the way an x/y-only proximity
+            // check would.
+            if (!sameLine && !isNextLine(lastWordRect, next.rect)) return null
             // PDFBox sometimes reports "[13]" as separate words ("[" then "13]") even without a
             // real space in the source — e.g. a font/style change mid-run. Only insert a space
-            // when there's an actual visible gap, or a glued "[" + "13]" becomes "[ 13]" and no
-            // longer matches the marker regex (which requires a digit immediately after "[").
-            if (horizontalGap(rect, next.rect) > GLUED_GAP_THRESHOLD) builder.append(' ')
+            // when there's an actual visible gap (same line) or a genuine line wrap, or a glued
+            // "[" + "13]" becomes "[ 13]" and no longer matches the marker regex (which requires
+            // a digit immediately after "[").
+            if (!sameLine || horizontalGap(lastWordRect, next.rect) > GLUED_GAP_THRESHOLD) builder.append(' ')
             builder.append(next.text)
             rect = union(rect, next.rect)
+            lastWordRect = next.rect
             if (next.text.contains(']')) {
                 val indices = parseMarker(builder.toString()) ?: return null
                 return InlineCitation(PdfWord(builder.toString(), rect), indices) to (j + 1)
@@ -78,8 +93,18 @@ object InlineCitationDetector {
     /** Below this, two words are treated as visually glued (no real space in the source PDF). */
     private const val GLUED_GAP_THRESHOLD = 0.0015f
 
+    /** How many line-heights below is still "the very next line", not a jump to a new paragraph. */
+    private const val LINE_WRAP_TOLERANCE = 1.8f
+
     private fun verticallyOverlaps(a: NormalizedRect, b: NormalizedRect): Boolean =
         a.top < b.bottom && b.top < a.bottom
+
+    private fun isNextLine(a: NormalizedRect, b: NormalizedRect): Boolean {
+        val lineHeight = a.bottom - a.top
+        if (lineHeight <= 0f) return false
+        val verticalGap = b.top - a.bottom
+        return verticalGap in (-lineHeight * 0.3f)..(lineHeight * LINE_WRAP_TOLERANCE)
+    }
 
     private fun union(a: NormalizedRect, b: NormalizedRect): NormalizedRect = NormalizedRect(
         left = minOf(a.left, b.left),

@@ -98,10 +98,20 @@ object PdfTitleExtractor {
         return lines
     }
 
+    /**
+     * PDFs assembled/converted from other tools (ps2pdf, gnuplot, LaTeX figure includes...) can
+     * leave the *document-level* `/Title` set to some unrelated fragment's own title instead of
+     * the paper's — observed in the wild: `large.eps` (a gnuplot figure's title leaking into the
+     * merged PDF) and `+0.8% 28M` (a chart data-point label). Neither is a filename-only pattern
+     * nor an exact "untitled"-style match, so beyond the filename-extension check, also reject
+     * anything that isn't mostly letters — a real paper title is never mostly digits/symbols.
+     */
     private fun looksGeneric(title: String): Boolean {
         val normalized = title.lowercase()
-        return normalized in setOf("untitled", "document", "microsoft word - document") ||
-            Regex("^[a-z0-9_-]+\\.(pdf|docx?|tex)$").matches(normalized)
+        if (normalized in setOf("untitled", "document", "microsoft word - document")) return true
+        if (Regex("^[a-z0-9_-]+\\.(pdf|docx?|tex|eps|ps|png|jpe?g|svg|ai|fig|gp)$").matches(normalized)) return true
+        val letterCount = title.count { it.isLetter() }
+        return letterCount < title.length * 0.5
     }
 
     private val boilerplateFragments = listOf(

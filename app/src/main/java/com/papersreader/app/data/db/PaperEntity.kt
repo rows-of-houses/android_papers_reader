@@ -17,6 +17,7 @@ data class PaperEntity(
     val addedAt: Long,
     val lastOpenedAt: Long? = null,
     val lastPage: Int = 0,
+    val lastZoom: Float = 1f,
     val pageCount: Int? = null,
     val fileSizeBytes: Long = 0,
 )

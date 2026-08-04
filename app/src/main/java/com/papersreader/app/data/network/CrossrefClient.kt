@@ -10,7 +10,9 @@ import java.net.URLEncoder
 import javax.inject.Inject
 import javax.inject.Singleton
 
-data class ResolvedReference(val title: String, val url: String)
+data class ResolvedReference(val title: String, val url: String, val doi: String?)
+
+private data class CrossrefCandidate(val title: String, val url: String, val doi: String?, val score: Double)
 
 /**
  * Resolves a raw citation string ("J. Smith et al., Attention is all you need, NeurIPS 2017")
@@ -41,12 +43,12 @@ class CrossrefClient @Inject constructor(
                     .mapNotNull { item ->
                         val title = item.title.firstOrNull() ?: return@mapNotNull null
                         val url = item.URL ?: item.DOI?.let { "https://doi.org/$it" } ?: return@mapNotNull null
-                        Triple(title, url, ReferenceMatcher.titleOverlapScore(title, referenceText))
+                        CrossrefCandidate(title, url, item.DOI, ReferenceMatcher.titleOverlapScore(title, referenceText))
                     }
-                    .maxByOrNull { it.third } ?: return@withContext null
+                    .maxByOrNull { it.score } ?: return@withContext null
 
-                if (best.third < ReferenceMatcher.MIN_MATCH_SCORE) return@withContext null
-                ResolvedReference(title = best.first, url = best.second)
+                if (best.score < ReferenceMatcher.MIN_MATCH_SCORE) return@withContext null
+                ResolvedReference(title = best.title, url = best.url, doi = best.doi)
             }
         } catch (e: Exception) {
             Timber.w(e, "Crossref resolution failed for reference")

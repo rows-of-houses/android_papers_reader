@@ -29,6 +29,7 @@ fun PapersReaderNavGraph(pendingImportUri: String?, onPendingImportConsumed: () 
             ReaderScreen(
                 paperId = paperId,
                 onBack = { navController.popBackStack() },
+                onOpenPaper = { newPaperId -> navController.navigate(Screen.Reader.route(newPaperId)) },
             )
         }
         composable(Screen.Logs.route) {

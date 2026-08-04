@@ -1,7 +1,9 @@
 package com.papersreader.app.data.repository
 
+import com.papersreader.app.data.network.ArxivClient
 import com.papersreader.app.data.network.CrossrefClient
 import com.papersreader.app.data.network.OpenAccessUrlRewriter
+import com.papersreader.app.data.network.ReferenceMatcher
 import com.papersreader.app.data.pdf.ParsedReference
 import com.papersreader.app.data.pdf.ReferenceParser
 import kotlinx.coroutines.Dispatchers
@@ -19,6 +21,7 @@ data class ReferenceTarget(val url: String, val resolvedTitle: String?)
 @Singleton
 class ReferenceRepository @Inject constructor(
     private val crossrefClient: CrossrefClient,
+    private val arxivClient: ArxivClient,
     private val httpClient: OkHttpClient,
 ) {
     fun parseReferences(file: File): List<ParsedReference> = ReferenceParser.parse(file)
@@ -42,9 +45,22 @@ class ReferenceRepository @Inject constructor(
      * patterns (currently just arXiv) to their direct PDF URL, then does a real GET and only
      * keeps the bytes if the server actually answered with a PDF — paywalled/HTML landing pages
      * correctly return null here rather than saving garbage into the library.
+     *
+     * When that direct attempt fails and [fallbackTitle] is given, also searches arXiv by title —
+     * many CS references resolve (via Crossref) to a paywalled publisher/DOI page even though the
+     * same paper has an open-access arXiv preprint (e.g. "A ConvNet for the 2020s" / ConvNeXt).
      */
-    suspend fun tryDownloadOpenAccessPdf(url: String): ByteArray? = withContext(Dispatchers.IO) {
-        val candidate = OpenAccessUrlRewriter.toDirectPdfUrl(url)
+    suspend fun tryDownloadOpenAccessPdf(url: String, fallbackTitle: String? = null): ByteArray? =
+        withContext(Dispatchers.IO) {
+            downloadIfPdf(OpenAccessUrlRewriter.toDirectPdfUrl(url))
+                ?: fallbackTitle?.let { title ->
+                    arxivClient.searchByTitle(title)
+                        .firstOrNull { ReferenceMatcher.titleOverlapScore(it.title, title) >= ReferenceMatcher.MIN_MATCH_SCORE }
+                        ?.let { hit -> downloadIfPdf(hit.pdfUrl) }
+                }
+        }
+
+    private suspend fun downloadIfPdf(candidate: String): ByteArray? = withContext(Dispatchers.IO) {
         runCatching {
             val request = Request.Builder()
                 .url(candidate)
@@ -58,7 +74,7 @@ class ReferenceRepository @Inject constructor(
                 if (!looksLikePdf) return@withContext null
                 response.body?.bytes()
             }
-        }.onFailure { Timber.w(it, "Open-access download failed for $url") }.getOrNull()
+        }.onFailure { Timber.w(it, "Open-access download failed for $candidate") }.getOrNull()
     }
 
     private fun scholarSearchUrl(query: String): String {

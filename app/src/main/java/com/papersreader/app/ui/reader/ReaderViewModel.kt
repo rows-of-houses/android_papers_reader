@@ -75,6 +75,7 @@ data class ReaderUiState(
     val canUndoAnnotation: Boolean = false,
     val downloadingReferenceIndex: Int? = null,
     val libraryMessage: String? = null,
+    val openPaperId: Long? = null,
 )
 
 @HiltViewModel
@@ -271,18 +272,27 @@ class ReaderViewModel @Inject constructor(
         _uiState.value = _uiState.value.copy(libraryMessage = null)
     }
 
+    /** Consumes the one-shot [ReaderUiState.openPaperId] navigation event once handled. */
+    fun consumeOpenPaperId() {
+        _uiState.value = _uiState.value.copy(openPaperId = null)
+    }
+
     /**
-     * One-click "download this reference straight into the library" — only succeeds when the
-     * resolved link is (or can be turned into, e.g. an arXiv /abs/ page) a directly downloadable
-     * open-access PDF. Deliberately does *not* open a browser tab on failure — the user opted
-     * into a silent download, not a navigation, so a failure just reports why via
+     * One-click "download this reference straight into the library, then open it" — only
+     * succeeds when the resolved link is (or can be turned into, e.g. an arXiv /abs/ page, or
+     * found via an arXiv title search as a fallback for paywalled DOI landing pages) a directly
+     * downloadable open-access PDF. Deliberately does *not* open a browser tab on failure — the
+     * user opted into a silent download, not a navigation, so a failure just reports why via
      * [ReaderUiState.libraryMessage]; they can still tap "Open" separately if they want the page.
      */
     fun downloadReferenceToLibrary(reference: ParsedReference) {
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(downloadingReferenceIndex = reference.index)
             val target = referenceRepository.resolveTarget(reference.text)
-            val bytes = referenceRepository.tryDownloadOpenAccessPdf(target.url)
+            val bytes = referenceRepository.tryDownloadOpenAccessPdf(
+                url = target.url,
+                fallbackTitle = target.resolvedTitle ?: reference.text.take(200),
+            )
             _uiState.value = if (bytes != null) {
                 val result = libraryRepository.importFromBytes(
                     bytes,
@@ -295,6 +305,7 @@ class ReaderViewModel @Inject constructor(
                         onSuccess = { "Saved to library" },
                         onFailure = { "Download succeeded but import failed: ${it.message}" },
                     ),
+                    openPaperId = result.getOrNull(),
                 )
             } else {
                 _uiState.value.copy(

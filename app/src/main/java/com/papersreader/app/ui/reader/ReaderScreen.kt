@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Box
@@ -70,6 +71,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.PointerInputScope
@@ -104,6 +106,7 @@ private data class PendingNote(val page: Int, val anchor: NormalizedRect)
 fun ReaderScreen(
     paperId: Long,
     onBack: () -> Unit,
+    onOpenPaper: (Long) -> Unit,
     viewModel: ReaderViewModel = hiltViewModel(),
 ) {
     LaunchedEffect(paperId) { viewModel.open(paperId) }
@@ -139,6 +142,17 @@ fun ReaderScreen(
         uiState.libraryMessage?.let { message ->
             snackbarHostState.showSnackbar(message)
             viewModel.dismissLibraryMessage()
+        }
+    }
+
+    // A reference download that succeeds should open, not just silently save — mirrors tapping
+    // it in the library right after import.
+    LaunchedEffect(uiState.openPaperId) {
+        uiState.openPaperId?.let { newPaperId ->
+            showReferences = false
+            inspectedCitation = null
+            viewModel.consumeOpenPaperId()
+            onOpenPaper(newPaperId)
         }
     }
 
@@ -241,13 +255,29 @@ fun ReaderScreen(
                     modifier = Modifier
                         .fillMaxSize()
                         .pointerInput(uiState.mode) {
+                            // Pivots the scale change around the pinch's actual focal point
+                            // instead of a fixed origin — with the layer's transformOrigin set to
+                            // TopStart below, panX/panY *are* the translation applied post-scale,
+                            // so keeping the point under the fingers visually fixed as zoom
+                            // changes (and folding in the raw two-finger drag on top) is a single
+                            // update: newPan = focal*(1-ratio) + pan + ratio*oldPan. See
+                            // detectPinchZoom's doc comment for the derivation.
                             if (uiState.mode != ReaderMode.VIEW) return@pointerInput
-                            detectPinchZoom { pan, gestureZoom ->
-                                zoom = (zoom * gestureZoom).coerceIn(1f, 5f)
-                                val maxPanX = size.width * (zoom - 1) / 2f
-                                val maxPanY = size.height * (zoom - 1) / 2f
-                                panX = if (zoom <= 1f) 0f else (panX + pan.x).coerceIn(-maxPanX, maxPanX)
-                                panY = if (zoom <= 1f) 0f else (panY + pan.y).coerceIn(-maxPanY, maxPanY)
+                            detectPinchZoom { centroid, pan, gestureZoom ->
+                                val oldZoom = zoom
+                                val newZoom = (oldZoom * gestureZoom).coerceIn(1f, 5f)
+                                val ratio = if (oldZoom != 0f) newZoom / oldZoom else 1f
+                                zoom = newZoom
+
+                                val minX = size.width * (1 - newZoom)
+                                panX = (centroid.x * (1 - ratio) + pan.x + ratio * panX).coerceIn(minX, 0f)
+
+                                val minY = size.height * (1 - newZoom)
+                                val rawY = centroid.y * (1 - ratio) + pan.y + ratio * panY
+                                val clampedY = rawY.coerceIn(minY, 0f)
+                                val leftoverY = rawY - clampedY
+                                panY = clampedY
+                                if (leftoverY != 0f) listState.dispatchRawDelta(-leftoverY / newZoom)
                             }
                         }
                         .pointerInput(uiState.mode) {
@@ -262,18 +292,24 @@ fun ReaderScreen(
                             // stopping ("hitting a wall") while still visually mid-document.
                             if (uiState.mode != ReaderMode.VIEW) return@pointerInput
                             detectSingleFingerFreePan(isPannable = { zoom > 1f }) { dx, dy ->
-                                val maxPanX = size.width * (zoom - 1) / 2f
-                                panX = (panX + dx).coerceIn(-maxPanX, maxPanX)
+                                val minX = size.width * (1 - zoom)
+                                panX = (panX + dx).coerceIn(minX, 0f)
 
-                                val maxPanY = size.height * (zoom - 1) / 2f
+                                val minY = size.height * (1 - zoom)
                                 val target = panY + dy
-                                val clamped = target.coerceIn(-maxPanY, maxPanY)
+                                val clamped = target.coerceIn(minY, 0f)
                                 val leftover = target - clamped
                                 panY = clamped
                                 if (leftover != 0f) listState.dispatchRawDelta(-leftover / zoom)
                             }
                         }
-                        .graphicsLayer(scaleX = zoom, scaleY = zoom, translationX = panX, translationY = panY),
+                        .graphicsLayer(
+                            scaleX = zoom,
+                            scaleY = zoom,
+                            translationX = panX,
+                            translationY = panY,
+                            transformOrigin = TransformOrigin(0f, 0f),
+                        ),
                 ) {
                     items(uiState.pageCount, key = { it }) { pageIndex ->
                         PageContent(
@@ -771,8 +807,15 @@ private fun AnnotationInspectDialog(annotation: Annotation, onDelete: () -> Unit
  * consuming position changes from a single finger too — that ate every tap on a citation or
  * annotation before it could reach the page's own tap detector underneath, and also fought
  * LazyColumn's own single-finger scroll.
+ *
+ * Reports the gesture's focal point (centroid of the touches, in the same untransformed
+ * coordinate space pointer input always sees regardless of the graphicsLayer scale/translation
+ * applied further down the modifier chain) alongside the usual pan/zoom deltas, so the caller can
+ * scale *around that point* — without it, the only available pivot is graphicsLayer's fixed
+ * transformOrigin, which makes the content appear to zoom from a corner instead of from between
+ * the fingers.
  */
-private suspend fun PointerInputScope.detectPinchZoom(onGesture: (pan: Offset, zoom: Float) -> Unit) {
+private suspend fun PointerInputScope.detectPinchZoom(onGesture: (centroid: Offset, pan: Offset, zoom: Float) -> Unit) {
     awaitEachGesture {
         awaitFirstDown(requireUnconsumed = false)
         do {
@@ -780,8 +823,9 @@ private suspend fun PointerInputScope.detectPinchZoom(onGesture: (pan: Offset, z
             if (event.changes.size >= 2) {
                 val zoomChange = event.calculateZoom()
                 val panChange = event.calculatePan()
+                val centroid = event.calculateCentroid(useCurrent = true)
                 if (zoomChange != 1f || panChange != Offset.Zero) {
-                    onGesture(panChange, zoomChange)
+                    onGesture(centroid, panChange, zoomChange)
                     event.changes.forEach { if (it.positionChanged()) it.consume() }
                 }
             }

@@ -3,6 +3,8 @@ package com.papersreader.app.ui.reader
 import android.graphics.Bitmap
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.papersreader.app.data.pdf.AuthorYearMatcher
+import com.papersreader.app.data.pdf.CitationKey
 import com.papersreader.app.data.pdf.DocumentSearchMatcher
 import com.papersreader.app.data.pdf.InlineCitation
 import com.papersreader.app.data.pdf.OutlineEntry
@@ -269,12 +271,18 @@ class ReaderViewModel @Inject constructor(
     }
 
     /**
-     * An inline "[12]" (or "[3, 7]", "[4-6]") tap resolves every referenced entry, like Scholar
-     * PDF Reader — a citation dialog decides whether to show one reference directly or a list
-     * to choose from, based on how many indices this marker actually grouped together.
+     * An inline "[12]" (or "[3, 7]", "[4-6]", or author-year "(Vaswani et al., 2017)") tap
+     * resolves every referenced entry, like Scholar PDF Reader — a citation dialog decides
+     * whether to show one reference directly or a list to choose from, based on how many keys
+     * this marker actually grouped together.
      */
     fun referencesForCitation(citation: InlineCitation): List<ParsedReference> =
-        citation.referenceIndices.mapNotNull { index -> _uiState.value.references.getOrNull(index - 1) }
+        citation.keys.mapNotNull { key ->
+            when (key) {
+                is CitationKey.Numbered -> _uiState.value.references.getOrNull(key.index - 1)
+                is CitationKey.AuthorYear -> _uiState.value.references.firstOrNull { AuthorYearMatcher.matches(it.text, key) }
+            }
+        }
 
     fun dismissLibraryMessage() {
         _uiState.value = _uiState.value.copy(libraryMessage = null)

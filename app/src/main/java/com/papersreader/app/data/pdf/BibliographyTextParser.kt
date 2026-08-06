@@ -16,6 +16,20 @@ object BibliographyTextParser {
     // left margin with "Surname, " and, unlike numbered styles, has no leading digit/bracket.
     private val authorYearEntryMarkerRegex = Regex("(?m)^\\p{Lu}[\\p{L}\\-']+,\\s")
 
+    // ACL Anthology-style entries ("Alan Akbik, Duncan Blythe, and Roland Vollgraf. 2018. Title.
+    // Venue..." — first name first, no comma after the first author, entries run together with
+    // no numbering or blank lines at all). Unlike the surname-first style above, there's no
+    // marker sitting right at the left margin to anchor on — the only reliable, recurring shape
+    // is the author list *itself*: one or more capitalized names, comma-separated, ending in
+    // "and <Name>. <year>." A name word excludes ALL-CAPS tokens (`(?!\p{Lu}{2,}\b)`) so venue
+    // abbreviations like "NIST" or "ACL" — which read exactly like a "name" otherwise — don't
+    // get swept into the *previous* entry's author list.
+    private val aclNameWord = "(?!\\p{Lu}{2,}\\b)\\p{Lu}[\\p{L}'\\-]*"
+    private val aclName = "$aclNameWord(?:\\s+$aclNameWord)*"
+    private val aclEntryMarkerRegex = Regex(
+        "$aclName(?:,\\s+$aclName)*,?\\s+and\\s+$aclName\\.\\s+(19|20)\\d{2}[a-z]?\\.\\s+",
+    )
+
     fun parse(fullText: String): List<ParsedReference> {
         val bibliographyText = sectionAfterHeading(fullText) ?: return emptyList()
         return splitEntries(bibliographyText)
@@ -34,15 +48,21 @@ object BibliographyTextParser {
     }
 
     fun splitEntries(bibliographyText: String): List<ParsedReference> {
-        splitOnMarkers(bibliographyText, numberedEntryMarkerRegex)?.let { return it }
-        splitOnMarkers(bibliographyText, authorYearEntryMarkerRegex)?.let { return it }
-        return emptyList()
-    }
-
-    /** Returns null (rather than an empty/single-entry list) if this marker style doesn't apply. */
-    private fun splitOnMarkers(bibliographyText: String, markerRegex: Regex): List<ParsedReference>? {
-        val markers = markerRegex.findAll(bibliographyText).toList()
-        if (markers.size < 2) return null
+        val candidates = listOf(
+            numberedEntryMarkerRegex.findAll(bibliographyText).toList(),
+            authorYearEntryMarkerRegex.findAll(bibliographyText).toList(),
+            aclEntryMarkerRegex.findAll(bibliographyText).toList(),
+        )
+        // Everything *after* the heading is searched, not just the bibliography itself, because
+        // there's no reliable way to detect where it ends in plain extracted text — so a later,
+        // unrelated numbered list (e.g. a "1. Question: ... 2. Question: ..." FAQ-style appendix,
+        // observed for real in BERT's paper) can rack up 2+ matches for the numbered style even
+        // though the actual bibliography right after the heading is author-year with no numbers
+        // at all. Whichever style's *first* match starts earliest in the text is the one actually
+        // describing this section — a real bibliography's first entry begins right after the
+        // heading, while a confounding list from a later section starts much further in.
+        val markers = candidates.filter { it.size >= 2 }.minByOrNull { it.first().range.first } ?: emptyList()
+        if (markers.size < 2) return emptyList()
 
         val entries = mutableListOf<ParsedReference>()
         for (i in markers.indices) {
@@ -55,6 +75,6 @@ object BibliographyTextParser {
                 entries.add(ParsedReference(index = entries.size + 1, text = raw))
             }
         }
-        return entries.ifEmpty { null }
+        return entries
     }
 }

@@ -97,7 +97,7 @@ fun AnnotationOverlay(
                         onDragCancel = { drawPoints = emptyList() },
                     )
                     ReaderMode.VIEW -> detectTapGestures { offset ->
-                        val citationHit = citations.lastOrNull { denormalize(it.word.rect, pageSizePx).contains(offset) }
+                        val citationHit = citations.lastOrNull { citation -> citation.rects.any { denormalize(it, pageSizePx).contains(offset) } }
                         if (citationHit != null) {
                             onCitationTapped(citationHit)
                             return@detectTapGestures

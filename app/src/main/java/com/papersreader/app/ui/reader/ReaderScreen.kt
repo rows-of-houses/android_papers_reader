@@ -718,7 +718,7 @@ private fun CitationDialog(
     // instead, which meant the interaction differed depending on the marker you happened to tap.
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Reference ${citation.referenceIndices.joinToString(", ")}") },
+        title = { Text("Reference ${citation.label}") },
         text = {
             if (references.isEmpty()) {
                 Text("Couldn't find this reference in the bibliography.")

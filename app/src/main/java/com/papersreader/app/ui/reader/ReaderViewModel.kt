@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.papersreader.app.data.pdf.AuthorYearMatcher
 import com.papersreader.app.data.pdf.CitationKey
+import com.papersreader.app.data.pdf.CodedMatcher
 import com.papersreader.app.data.pdf.DocumentSearchMatcher
 import com.papersreader.app.data.pdf.InlineCitation
 import com.papersreader.app.data.pdf.OutlineEntry
@@ -281,6 +282,7 @@ class ReaderViewModel @Inject constructor(
             when (key) {
                 is CitationKey.Numbered -> _uiState.value.references.getOrNull(key.index - 1)
                 is CitationKey.AuthorYear -> _uiState.value.references.firstOrNull { AuthorYearMatcher.matches(it.text, key) }
+                is CitationKey.Coded -> _uiState.value.references.firstOrNull { CodedMatcher.matches(it.text, key.code) }
             }
         }
 

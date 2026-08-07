@@ -17,7 +17,9 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.dp
 import com.papersreader.app.data.db.AnnotationType
 import com.papersreader.app.data.pdf.InlineCitation
 import com.papersreader.app.data.repository.Annotation
@@ -54,6 +56,11 @@ fun AnnotationOverlay(
     var dragStart by remember(mode) { mutableStateOf<Offset?>(null) }
     var dragCurrent by remember(mode) { mutableStateOf<Offset?>(null) }
     var drawPoints by remember(mode) { mutableStateOf<List<Offset>>(emptyList()) }
+    // Citation markers are often just a few characters ("[FB81]") — a tap landing a couple of
+    // pixels outside the glyphs' own tight bounding box (normal finger imprecision) otherwise
+    // missed every time. Inflating just the *hit-test* rect (not anything drawn) by a small,
+    // density-independent margin makes tapping reliable without changing how anything looks.
+    val citationHitSlopPx = with(LocalDensity.current) { 6.dp.toPx() }
 
     Canvas(
         modifier = modifier
@@ -97,7 +104,9 @@ fun AnnotationOverlay(
                         onDragCancel = { drawPoints = emptyList() },
                     )
                     ReaderMode.VIEW -> detectTapGestures { offset ->
-                        val citationHit = citations.lastOrNull { citation -> citation.rects.any { denormalize(it, pageSizePx).contains(offset) } }
+                        val citationHit = citations.lastOrNull { citation ->
+                            citation.rects.any { inflatedRect(denormalize(it, pageSizePx), citationHitSlopPx).contains(offset) }
+                        }
                         if (citationHit != null) {
                             onCitationTapped(citationHit)
                             return@detectTapGestures
@@ -178,6 +187,13 @@ private fun pointToNormalizedAnchor(point: Offset, pageSizePx: IntSize): Normali
     val y = point.y / pageSizePx.height
     return NormalizedRect(x, y, x, y)
 }
+
+private fun inflatedRect(rect: Rect, delta: Float): Rect = Rect(
+    left = rect.left - delta,
+    top = rect.top - delta,
+    right = rect.right + delta,
+    bottom = rect.bottom + delta,
+)
 
 private fun denormalize(rect: NormalizedRect, pageSizePx: IntSize): Rect = Rect(
     left = rect.left * pageSizePx.width,

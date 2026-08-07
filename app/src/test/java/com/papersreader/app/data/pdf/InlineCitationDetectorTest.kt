@@ -128,6 +128,62 @@ class InlineCitationDetectorTest {
     }
 
     @Test
+    fun `detects a single alpha bracket code citation`() {
+        // "[FB81]" style — author initials + 2-digit year, as natbib's alpha style generates.
+        // Real example from arXiv:2504.09648 (RANSAC Revisited), which the user reported as
+        // "citations by letters, not numbers" — the numeric-only bracket regex never matched it.
+        val citations = InlineCitationDetector.detect(listOf(word("[FB81]")))
+        assertEquals(1, citations.size)
+        assertEquals(listOf(CitationKey.Coded("FB81")), citations[0].keys)
+    }
+
+    @Test
+    fun `detects a grouped alpha bracket code citation`() {
+        val citations = InlineCitationDetector.detect(listOf(word("[Men14,"), word("Men15,"), word("LM17]")))
+        assertEquals(1, citations.size)
+        assertEquals(
+            listOf(CitationKey.Coded("Men14"), CitationKey.Coded("Men15"), CitationKey.Coded("LM17")),
+            citations[0].keys,
+        )
+    }
+
+    @Test
+    fun `detects a plus-suffixed alpha code split across a glued space`() {
+        // Real example: "[DJC+ 21]" (more authors than the code has room for get folded into a
+        // trailing "+") — PDFBox hands this back as two words, "[DJC+" and "21]", with a real
+        // gap between them (unlike the zero-gap glued case elsewhere in this file).
+        val words = listOf(
+            word("[DJC+", left = 0.20f, top = 0.50f, bottom = 0.52f, width = 0.04f),
+            word("21]", left = 0.245f, top = 0.50f, bottom = 0.52f, width = 0.025f),
+        )
+        val citations = InlineCitationDetector.detect(words)
+        assertEquals(1, citations.size)
+        assertEquals(listOf(CitationKey.Coded("DJC+21")), citations[0].keys)
+    }
+
+    @Test
+    fun `detects a coded citation with a trailing locator inside the brackets`() {
+        // Regression test: "Huber's contamination model [Hub64, Section 5-7], and the noiseless
+        // ..." from the real RANSAC Revisited paper (arXiv:2504.09648) that the user reported as
+        // not tappable — the code is followed by a section locator inside the *same* brackets,
+        // which previously made the whole bracket fail to match at all (it required every
+        // comma-separated piece to itself be a valid code).
+        val words = wordsOnLine("model", "[Hub64,", "Section", "5-7],", "and")
+        val citations = InlineCitationDetector.detect(words)
+        assertEquals(1, citations.size)
+        assertEquals(listOf(CitationKey.Coded("Hub64")), citations[0].keys)
+    }
+
+    @Test
+    fun `does not treat an ordinary two-digit-numbered bracket as a coded citation`() {
+        // "Table 12" / "Section 19" style — the space-before-digits allowance exists only for
+        // the "DJC+ 21" plus-suffix case; without a "+", a bare word followed by a two-digit
+        // number must not be mistaken for a citation code.
+        val words = wordsOnLine("see", "[Table", "12]", "for", "details")
+        assertTrue(InlineCitationDetector.detect(words).none { it.keys.any { k -> k is CitationKey.Coded } })
+    }
+
+    @Test
     fun `detects a single author-year citation`() {
         // "...self-attention layers of the Transformer (Vaswani et al., 2017)." — BERT's actual
         // citation style, which the bracket-only detector never handled at all.
@@ -211,5 +267,30 @@ class AuthorYearMatcherTest {
     fun `does not match a different author with the same year`() {
         val reference = "William B Dolan and Chris Brockett. 2005. Automatically constructing a corpus."
         assertTrue(!AuthorYearMatcher.matches(reference, CitationKey.AuthorYear("Smith", "2005")))
+    }
+}
+
+class CodedMatcherTest {
+
+    @Test
+    fun `matches the entry's own leading bracket code`() {
+        val reference = "[FB81] Martin A Fischler and Robert C Bolles. Random sample consensus. " +
+            "Communications of the ACM, 24(6):381-395, 1981."
+        assertTrue(CodedMatcher.matches(reference, "FB81"))
+    }
+
+    @Test
+    fun `normalizes a space inside a plus-suffixed code before comparing`() {
+        // Real example from arXiv:2504.09648 (RANSAC Revisited) — PDF text extraction rendered
+        // this entry's own code with an internal space, "[DJC+ 21]", same as the in-text citation.
+        val reference = "[DJC+ 21] Lijun Ding, Liwei Jiang, Yudong Chen, Qing Qu, and Zhihui Zhu. " +
+            "Rank overspecified robust matrix recovery."
+        assertTrue(CodedMatcher.matches(reference, "DJC+21"))
+    }
+
+    @Test
+    fun `does not match a different code`() {
+        val reference = "[FB81] Martin A Fischler and Robert C Bolles. Random sample consensus."
+        assertTrue(!CodedMatcher.matches(reference, "HJ94"))
     }
 }

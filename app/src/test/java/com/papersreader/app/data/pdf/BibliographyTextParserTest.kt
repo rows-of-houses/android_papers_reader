@@ -127,4 +127,36 @@ class BibliographyTextParserTest {
         """.trimIndent()
         assertTrue(BibliographyTextParser.parse(text).isEmpty())
     }
+
+    @Test
+    fun `parses alpha bracket code bibliography style`() {
+        // Real excerpt from arXiv:2504.09648 (RANSAC Revisited) — natbib alpha style, each entry
+        // marked with its own "[CODE]" (author initials + 2-digit year) at the left margin,
+        // including the "[DJC+ 21]" plus-suffix-with-space variant for a many-author entry.
+        val text = """
+            References
+            [ACW17]
+
+            Ery Arias-Castro and Jue Wang. Ransac algorithms for subspace recovery and subspace
+            clustering. arXiv preprint arXiv:1711.11220, 2017.
+
+            [CCFM20] Yuxin Chen, Yuejie Chi, Jianqing Fan, and Cong Ma. Spectral methods for data science:
+            A statistical perspective. arXiv preprint arXiv:2012.08496, 2020.
+            [DJC+ 21] Lijun Ding, Liwei Jiang, Yudong Chen, Qing Qu, and Zhihui Zhu. Rank overspecified robust matrix recovery.
+            [FB81]
+
+            Martin A Fischler and Robert C Bolles. Random sample consensus. Communications
+            of the ACM, 24(6):381-395, 1981.
+        """.trimIndent()
+
+        val refs = BibliographyTextParser.parse(text)
+        assertEquals(4, refs.size)
+        assertTrue(refs[0].text.startsWith("[ACW17]"))
+        assertTrue(refs[0].text.contains("Arias-Castro"))
+        assertTrue(refs[1].text.startsWith("[CCFM20]"))
+        assertTrue(refs[2].text.startsWith("[DJC+"))
+        assertTrue(refs[2].text.contains("Ding"))
+        assertTrue(refs[3].text.startsWith("[FB81]"))
+        assertTrue(refs[3].text.contains("Fischler"))
+    }
 }

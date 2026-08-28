@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import timber.log.Timber
+import java.io.File
 import javax.inject.Inject
 
 sealed interface ImportState {
@@ -47,6 +48,9 @@ class LibraryViewModel @Inject constructor(
     fun deletePaper(paper: PaperEntity) {
         viewModelScope.launch { libraryRepository.deletePaper(paper) }
     }
+
+    /** The on-disk PDF backing this paper — used to hand the source file to another app. */
+    fun paperFile(paper: PaperEntity): File = libraryRepository.paperFile(paper)
 
     fun dismissError() {
         _importState.value = ImportState.Idle

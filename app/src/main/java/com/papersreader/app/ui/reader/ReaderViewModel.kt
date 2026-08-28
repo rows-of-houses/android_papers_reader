@@ -18,6 +18,9 @@ import com.papersreader.app.data.pdf.ReferenceTitleGuesser
 import com.papersreader.app.data.pdf.SearchMatch
 import com.papersreader.app.data.repository.Annotation
 import com.papersreader.app.data.repository.AnnotationRepository
+import com.papersreader.app.data.repository.CitedByOutcome
+import com.papersreader.app.data.repository.CitedByRepository
+import com.papersreader.app.data.repository.CitingPaper
 import com.papersreader.app.data.repository.LibraryRepository
 import com.papersreader.app.data.repository.NormalizedRect
 import com.papersreader.app.data.repository.ReferenceRepository
@@ -81,6 +84,16 @@ data class ReaderUiState(
     val downloadingReferenceIndex: Int? = null,
     val libraryMessage: String? = null,
     val openPaperId: Long? = null,
+    val citedBy: List<CitingPaper> = emptyList(),
+    val citedByLoading: Boolean = false,
+    /** True once a fetch attempt (success or failure) has completed, so reopening the sheet
+     *  doesn't refire the network call every time. */
+    val citedByLoaded: Boolean = false,
+    /** True when the last fetch attempt failed to determine citations at all (couldn't resolve
+     *  the paper's identity, or the request itself failed) — distinct from [citedBy] genuinely
+     *  being empty, see [com.papersreader.app.data.repository.CitedByOutcome]. */
+    val citedByUnavailable: Boolean = false,
+    val downloadingCitedByPaperId: String? = null,
 )
 
 @HiltViewModel
@@ -88,6 +101,7 @@ class ReaderViewModel @Inject constructor(
     private val libraryRepository: LibraryRepository,
     private val annotationRepository: AnnotationRepository,
     private val referenceRepository: ReferenceRepository,
+    private val citedByRepository: CitedByRepository,
 ) : ViewModel() {
 
     private var renderer: PdfPageRenderer? = null
@@ -330,6 +344,85 @@ class ReaderViewModel @Inject constructor(
                 _uiState.value.copy(
                     downloadingReferenceIndex = null,
                     libraryMessage = "No open-access PDF found for this reference — tap Open to view it online instead",
+                )
+            }
+        }
+    }
+
+    /**
+     * Lazily fetches the "Cited by" list the first time its sheet is opened. Unlike references
+     * (parsed synchronously out of the local PDF, eagerly, in [open]), this is a slower external
+     * network round trip to Semantic Scholar — so it's deliberately deferred until the user
+     * actually asks for it, and only fetched once per paper (see [ReaderUiState.citedByLoaded]).
+     */
+    fun loadCitedByIfNeeded() {
+        val state = _uiState.value
+        if (state.citedByLoaded || state.citedByLoading) return
+        if (state.title.isBlank()) return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(citedByLoading = true)
+            when (val outcome = citedByRepository.findCitingPapers(state.title)) {
+                is CitedByOutcome.Found -> _uiState.value = _uiState.value.copy(
+                    citedBy = outcome.papers,
+                    citedByLoading = false,
+                    citedByLoaded = true,
+                    citedByUnavailable = false,
+                )
+                CitedByOutcome.Unavailable -> _uiState.value = _uiState.value.copy(
+                    citedBy = emptyList(),
+                    citedByLoading = false,
+                    citedByLoaded = true,
+                    citedByUnavailable = true,
+                )
+            }
+        }
+    }
+
+    /** Resets the "already attempted" gate so [loadCitedByIfNeeded] fetches again — offered in the
+     *  UI only after a [ReaderUiState.citedByUnavailable] result, since the free Semantic Scholar
+     *  tier's rate limit is often just transient. */
+    fun retryCitedBy() {
+        _uiState.value = _uiState.value.copy(citedByLoaded = false)
+        loadCitedByIfNeeded()
+    }
+
+    /**
+     * [CitingPaper.link] is already fully resolved by Semantic Scholar itself — no extra network
+     * round trip needed here, unlike [openReference] which has to resolve a raw reference string
+     * via Crossref first.
+     */
+    fun openCitedByPaper(paper: CitingPaper, onResolved: (url: String) -> Unit) {
+        onResolved(paper.link)
+    }
+
+    /** Mirrors [downloadReferenceToLibrary] exactly, keyed by Semantic Scholar paperId instead
+     *  of a reference-list index since citing papers have no natural index of their own. */
+    fun downloadCitedByPaper(paper: CitingPaper) {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(downloadingCitedByPaperId = paper.id)
+            val bytes = referenceRepository.tryDownloadOpenAccessPdf(
+                url = paper.link,
+                doi = paper.doi,
+                fallbackTitle = paper.title,
+            )
+            _uiState.value = if (bytes != null) {
+                val result = libraryRepository.importFromBytes(
+                    bytes,
+                    suggestedFallbackName = paper.title,
+                    sourceUrl = paper.link,
+                )
+                _uiState.value.copy(
+                    downloadingCitedByPaperId = null,
+                    libraryMessage = result.fold(
+                        onSuccess = { "Saved to library" },
+                        onFailure = { "Download succeeded but import failed: ${it.message}" },
+                    ),
+                    openPaperId = result.getOrNull(),
+                )
+            } else {
+                _uiState.value.copy(
+                    downloadingCitedByPaperId = null,
+                    libraryMessage = "No open-access PDF found for this paper — tap it to view it online instead",
                 )
             }
         }

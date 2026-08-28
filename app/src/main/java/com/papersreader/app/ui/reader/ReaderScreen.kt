@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Draw
 import androidx.compose.material.icons.filled.FormatColorText
+import androidx.compose.material.icons.filled.FormatQuote
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.LibraryBooks
@@ -80,7 +81,13 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -89,8 +96,11 @@ import com.papersreader.app.data.pdf.InlineCitation
 import com.papersreader.app.data.pdf.InlineCitationDetector
 import com.papersreader.app.data.pdf.OutlineEntry
 import com.papersreader.app.data.pdf.ParsedReference
+import com.papersreader.app.data.pdf.PdfTextSelector
+import com.papersreader.app.data.pdf.ReferenceTitleGuesser
 import com.papersreader.app.data.pdf.PdfWord
 import com.papersreader.app.data.repository.Annotation
+import com.papersreader.app.data.repository.CitingPaper
 import com.papersreader.app.data.repository.NormalizedRect
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -127,10 +137,12 @@ fun ReaderScreen(
     val searchState by viewModel.searchState.collectAsState()
 
     var showReferences by remember { mutableStateOf(false) }
+    var showCitedBy by remember { mutableStateOf(false) }
     var showOutline by remember { mutableStateOf(false) }
     var noteDialogAnchor by remember { mutableStateOf<PendingNote?>(null) }
     var inspectedAnnotation by remember { mutableStateOf<Annotation?>(null) }
     var inspectedCitation by remember { mutableStateOf<InlineCitation?>(null) }
+    val clipboardManager = LocalClipboardManager.current
 
     // Built with the paper's last-read page baked in as its *initial* index (re-keyed once
     // pageCount actually arrives, so the first real composition of this list already starts
@@ -143,6 +155,10 @@ fun ReaderScreen(
     }
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
+    val onCopyRequested: (List<PdfWord>) -> Unit = { words ->
+        clipboardManager.setText(AnnotatedString(PdfTextSelector.textFor(words)))
+        scope.launch { snackbarHostState.showSnackbar("Copied to clipboard") }
+    }
 
     var zoom by remember { mutableStateOf(1f) }
     var panX by remember { mutableStateOf(0f) }
@@ -160,6 +176,7 @@ fun ReaderScreen(
     LaunchedEffect(uiState.openPaperId) {
         uiState.openPaperId?.let { newPaperId ->
             showReferences = false
+            showCitedBy = false
             inspectedCitation = null
             viewModel.consumeOpenPaperId()
             onOpenPaper(newPaperId)
@@ -265,6 +282,12 @@ fun ReaderScreen(
                         IconButton(onClick = { showReferences = true }) {
                             Icon(Icons.Filled.LibraryBooks, contentDescription = "References")
                         }
+                        IconButton(onClick = {
+                            showCitedBy = true
+                            viewModel.loadCitedByIfNeeded()
+                        }) {
+                            Icon(Icons.Filled.FormatQuote, contentDescription = "Cited by")
+                        }
                     },
                 )
             }
@@ -364,6 +387,7 @@ fun ReaderScreen(
                         PageContent(
                             pageIndex = pageIndex,
                             mode = uiState.mode,
+                            zoom = zoom,
                             annotations = annotationsByPage[pageIndex] ?: emptyList(),
                             words = pageWords[pageIndex] ?: emptyList(),
                             searchHighlights = searchState.matches
@@ -379,6 +403,7 @@ fun ReaderScreen(
                             onDrawingCreated = { points -> viewModel.addDrawing(pageIndex, points) },
                             onAnnotationTapped = { annotation -> inspectedAnnotation = annotation },
                             onCitationTapped = { citation -> inspectedCitation = citation },
+                            onCopyRequested = onCopyRequested,
                         )
                     }
                 }
@@ -401,6 +426,22 @@ fun ReaderScreen(
             },
             onDownloadClick = { ref -> viewModel.downloadReferenceToLibrary(ref) },
             onDismiss = { showReferences = false },
+        )
+    }
+
+    if (showCitedBy) {
+        CitedBySheet(
+            citingPapers = uiState.citedBy,
+            loading = uiState.citedByLoading,
+            unavailable = uiState.citedByUnavailable,
+            downloadingPaperId = uiState.downloadingCitedByPaperId,
+            onPaperClick = { paper ->
+                showCitedBy = false
+                viewModel.openCitedByPaper(paper, onResolved = openInSystemBrowser)
+            },
+            onDownloadClick = { paper -> viewModel.downloadCitedByPaper(paper) },
+            onRetry = { viewModel.retryCitedBy() },
+            onDismiss = { showCitedBy = false },
         )
     }
 
@@ -544,6 +585,7 @@ private fun MarkerPickerBar(
 private fun PageContent(
     pageIndex: Int,
     mode: ReaderMode,
+    zoom: Float,
     annotations: List<Annotation>,
     words: List<PdfWord>,
     searchHighlights: List<NormalizedRect>,
@@ -557,6 +599,7 @@ private fun PageContent(
     onDrawingCreated: (List<NormalizedRect>) -> Unit,
     onAnnotationTapped: (Annotation) -> Unit,
     onCitationTapped: (InlineCitation) -> Unit,
+    onCopyRequested: (List<PdfWord>) -> Unit,
 ) {
     var containerWidth by remember { mutableStateOf(0) }
     var aspectRatio by remember(pageIndex) { mutableStateOf<Float?>(null) }
@@ -599,11 +642,13 @@ private fun PageContent(
             AnnotationOverlay(
                 modifier = exactSizeModifier,
                 mode = mode,
+                zoom = zoom,
                 annotations = annotations,
                 // The overlay draws in on-screen pixels, which can differ from the bitmap's own
                 // (deliberately higher-resolution, see RENDER_SCALE_FACTOR) pixel dimensions.
                 pageSizePx = IntSize(containerWidth, displayedHeightPx ?: currentBitmap.height),
                 citations = citations,
+                words = words,
                 searchHighlights = searchHighlights,
                 activeSearchHighlight = activeSearchHighlight,
                 drawColor = drawColor,
@@ -613,6 +658,7 @@ private fun PageContent(
                 onDrawingCreated = onDrawingCreated,
                 onAnnotationTapped = onAnnotationTapped,
                 onCitationTapped = onCitationTapped,
+                onCopyRequested = onCopyRequested,
             )
         }
     }
@@ -703,6 +749,25 @@ private fun OutlineSheet(outline: List<OutlineEntry>, onEntryClick: (OutlineEntr
     }
 }
 
+/** "N. Authors. **Title**. Venue..." — bolds the guessed title span so it stands out from the
+ *  authors/venue noise around it, reused by both [CitationDialog] and [ReferencesSheet]. */
+@Composable
+private fun referenceLabel(ref: ParsedReference): AnnotatedString = remember(ref) {
+    buildAnnotatedString {
+        append("${ref.index}. ")
+        val titleRange = ReferenceTitleGuesser.findTitleRange(ref.text)
+        if (titleRange == null) {
+            append(ref.text)
+        } else {
+            append(ref.text.substring(0, titleRange.first))
+            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+                append(ref.text.substring(titleRange.first, titleRange.last + 1))
+            }
+            append(ref.text.substring(titleRange.last + 1))
+        }
+    }
+}
+
 @Composable
 private fun CitationDialog(
     citation: InlineCitation,
@@ -727,7 +792,7 @@ private fun CitationDialog(
                     items(references, key = { it.index }) { ref ->
                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                             Text(
-                                "${ref.index}. ${ref.text}",
+                                referenceLabel(ref),
                                 modifier = Modifier
                                     .weight(1f)
                                     .clickable { onOpen(ref) }
@@ -781,7 +846,7 @@ private fun ReferencesSheet(
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(
-                                "${ref.index}. ${ref.text}",
+                                referenceLabel(ref),
                                 modifier = Modifier
                                     .weight(1f)
                                     .clickable { onReferenceClick(ref) }
@@ -792,6 +857,82 @@ private fun ReferencesSheet(
                                 CircularProgressIndicator(modifier = Modifier.size(24.dp).padding(8.dp))
                             } else {
                                 IconButton(onClick = { onDownloadClick(ref) }) {
+                                    Icon(Icons.Filled.Download, contentDescription = "Download to library")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun citedByLabel(paper: CitingPaper): AnnotatedString = remember(paper) {
+    buildAnnotatedString {
+        withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(paper.title) }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CitedBySheet(
+    citingPapers: List<CitingPaper>,
+    loading: Boolean,
+    unavailable: Boolean,
+    downloadingPaperId: String?,
+    onPaperClick: (CitingPaper) -> Unit,
+    onDownloadClick: (CitingPaper) -> Unit,
+    onRetry: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState()
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
+        Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+            Text("Cited by", style = MaterialTheme.typography.titleLarge)
+            Text(
+                "Papers that cite this one, found via Semantic Scholar. Tap a title to open it in " +
+                    "your browser, or tap the download icon to save an open-access PDF straight to " +
+                    "your library and read it right away.",
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+            when {
+                loading -> CircularProgressIndicator(modifier = Modifier.align(Alignment.CenterHorizontally))
+                unavailable -> Column {
+                    Text("Couldn't reach Semantic Scholar right now (it's often just a temporary rate limit) — try again in a moment.")
+                    TextButton(onClick = onRetry, modifier = Modifier.align(Alignment.End)) { Text("Retry") }
+                }
+                citingPapers.isEmpty() -> Text("No citing papers found.")
+                else -> LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 400.dp)) {
+                    items(citingPapers, key = { it.id }) { paper ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { onPaperClick(paper) }
+                                    .padding(vertical = 8.dp),
+                            ) {
+                                Text(citedByLabel(paper), style = MaterialTheme.typography.bodyMedium)
+                                val subtitle = buildString {
+                                    paper.authorsDisplay?.let { append(it) }
+                                    paper.year?.let {
+                                        if (isNotEmpty()) append(" · ")
+                                        append(it)
+                                    }
+                                }
+                                if (subtitle.isNotBlank()) {
+                                    Text(subtitle, style = MaterialTheme.typography.bodySmall)
+                                }
+                            }
+                            if (downloadingPaperId == paper.id) {
+                                CircularProgressIndicator(modifier = Modifier.size(24.dp).padding(8.dp))
+                            } else {
+                                IconButton(onClick = { onDownloadClick(paper) }) {
                                     Icon(Icons.Filled.Download, contentDescription = "Download to library")
                                 }
                             }

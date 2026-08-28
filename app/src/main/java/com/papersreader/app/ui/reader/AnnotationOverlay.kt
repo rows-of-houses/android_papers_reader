@@ -1,7 +1,6 @@
 package com.papersreader.app.ui.reader
 
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -10,7 +9,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material3.Icon
@@ -22,7 +20,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -303,9 +300,14 @@ fun AnnotationOverlay(
     }
 }
 
-/** A small draggable circle at one end of a text selection, matching the system's own text
- *  handles — dragging it re-anchors that end of the selection while the other end stays fixed.
- *  [inverseZoom] keeps its on-screen size constant regardless of how far the page is zoomed in. */
+/**
+ * A small draggable teardrop at one end of a text selection — a circular body with a point on
+ * top that touches the exact line-bottom anchor, the same silhouette the OS's own text-selection
+ * handles use (a bare circle floating below the line, tried first, didn't read as a "selection
+ * handle" at all) — dragging it re-anchors that end of the selection while the other end stays
+ * fixed. [inverseZoom] keeps its on-screen size constant regardless of how far the page is
+ * zoomed in.
+ */
 @Composable
 private fun SelectionHandle(xPx: Float, yPx: Float, inverseZoom: Float, onDrag: (Offset) -> Unit) {
     val liveX by rememberUpdatedState(xPx)
@@ -314,6 +316,7 @@ private fun SelectionHandle(xPx: Float, yPx: Float, inverseZoom: Float, onDrag: 
     val dotSizeDp = HANDLE_DOT_SIZE_DP.dp * inverseZoom
     val touchRadiusPx = with(LocalDensity.current) { (touchSizeDp / 2).toPx() }
     val liveTouchRadiusPx by rememberUpdatedState(touchRadiusPx)
+    val handleColor = MaterialTheme.colorScheme.primary
     Box(
         modifier = Modifier
             .offset { IntOffset((xPx - touchRadiusPx).roundToInt(), yPx.roundToInt()) }
@@ -329,14 +332,25 @@ private fun SelectionHandle(xPx: Float, yPx: Float, inverseZoom: Float, onDrag: 
                     onDrag(Offset(liveX - liveTouchRadiusPx + change.position.x, liveY + change.position.y))
                 }
             },
-        contentAlignment = Alignment.TopCenter,
     ) {
-        Box(
-            Modifier
-                .padding(top = (touchSizeDp - dotSizeDp) / 2)
-                .size(dotSizeDp)
-                .background(MaterialTheme.colorScheme.primary, CircleShape),
-        )
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val radius = dotSizeDp.toPx() / 2
+            val centerX = size.width / 2
+            // The tip sits at local y=0, which is exactly where this Box's own offset places the
+            // *anchor* point (yPx) — see the .offset{} above — so the point visually touches the
+            // line the same way a native handle's point touches the text baseline.
+            val circleCenterY = radius
+            drawCircle(color = handleColor, radius = radius, center = Offset(centerX, circleCenterY))
+            drawPath(
+                path = Path().apply {
+                    moveTo(centerX, 0f)
+                    lineTo(centerX - radius, circleCenterY)
+                    lineTo(centerX + radius, circleCenterY)
+                    close()
+                },
+                color = handleColor,
+            )
+        }
     }
 }
 
@@ -402,6 +416,7 @@ private fun wordsAt(words: List<PdfWord>, from: Offset, to: Offset, pageSizePx: 
         fromY = from.y / pageSizePx.height,
         toX = to.x / pageSizePx.width,
         toY = to.y / pageSizePx.height,
+        pageAspectRatio = pageSizePx.height.toFloat() / pageSizePx.width,
     )
 }
 

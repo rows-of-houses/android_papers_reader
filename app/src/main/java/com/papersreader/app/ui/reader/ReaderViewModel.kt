@@ -8,6 +8,7 @@ import com.papersreader.app.data.pdf.CitationKey
 import com.papersreader.app.data.pdf.CodedMatcher
 import com.papersreader.app.data.pdf.DocumentSearchMatcher
 import com.papersreader.app.data.pdf.InlineCitation
+import com.papersreader.app.data.pdf.InlineCitationDetector
 import com.papersreader.app.data.pdf.OutlineEntry
 import com.papersreader.app.data.pdf.ParsedReference
 import com.papersreader.app.data.pdf.PdfOutlineExtractor
@@ -26,6 +27,8 @@ import com.papersreader.app.data.repository.NormalizedRect
 import com.papersreader.app.data.repository.ReferenceRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -128,6 +131,14 @@ class ReaderViewModel @Inject constructor(
     private val _pageWords = MutableStateFlow<Map<Int, List<PdfWord>>>(emptyMap())
     val pageWords: StateFlow<Map<Int, List<PdfWord>>> = _pageWords
 
+    // Precomputed off the main thread alongside pageWords rather than lazily per page inside the
+    // reader's Composable (as it used to be): running InlineCitationDetector's regex matching
+    // synchronously during a fresh page's first composition was real, main-thread work landing
+    // exactly when a page scrolls into view for the first time — a plausible source of the
+    // scroll-jank complaints, since that's precisely when a fling most needs every frame.
+    private val _pageCitations = MutableStateFlow<Map<Int, List<InlineCitation>>>(emptyMap())
+    val pageCitations: StateFlow<Map<Int, List<InlineCitation>>> = _pageCitations
+
     /**
      * All of the paper's annotations, not just the "current" page's — with continuous
      * vertical scroll several pages can be visible/interacted with at once, so each page needs
@@ -167,8 +178,12 @@ class ReaderViewModel @Inject constructor(
 
     private fun loadAllPageWords(file: File) {
         viewModelScope.launch {
-            val words = withContext(Dispatchers.Default) { PdfWordExtractor.extractAllPages(file) }
+            val (words, citations) = withContext(Dispatchers.Default) {
+                val extracted = PdfWordExtractor.extractAllPages(file)
+                extracted to extracted.mapValues { (_, pageWords) -> InlineCitationDetector.detect(pageWords) }
+            }
             _pageWords.value = words
+            _pageCitations.value = citations
         }
     }
 
@@ -195,11 +210,23 @@ class ReaderViewModel @Inject constructor(
     suspend fun pageAspectRatio(pageIndex: Int): Float =
         runCatching { renderer?.pageAspectRatio(pageIndex) }.getOrNull() ?: (1f / 1.414f)
 
-    /** Persists the current page + zoom so the reader reopens exactly where it was left off. */
+    private var persistPositionJob: Job? = null
+
+    /**
+     * Persists the current page + zoom so the reader reopens exactly where it was left off. The
+     * DB write itself is debounced: during a fast fling this fires once per page boundary
+     * crossed, and letting every single one launch its own write is pure churn for a position
+     * that's about to be overwritten again a moment later — only the position the scroll actually
+     * settles on needs to reach disk.
+     */
     fun onPageChanged(page: Int, zoom: Float) {
         _uiState.value = _uiState.value.copy(currentPage = page)
         currentPageFlow.value = page
-        viewModelScope.launch { libraryRepository.updateReadingPosition(paperId, page, zoom) }
+        persistPositionJob?.cancel()
+        persistPositionJob = viewModelScope.launch {
+            delay(POSITION_PERSIST_DEBOUNCE_MS)
+            libraryRepository.updateReadingPosition(paperId, page, zoom)
+        }
     }
 
     /** Same persistence as [onPageChanged], without touching the (already-correct) current-page state — used when leaving the reader to also capture a zoom change made without scrolling to a new page. */
@@ -490,5 +517,9 @@ class ReaderViewModel @Inject constructor(
     override fun onCleared() {
         super.onCleared()
         renderer?.close()
+    }
+
+    companion object {
+        private const val POSITION_PERSIST_DEBOUNCE_MS = 300L
     }
 }

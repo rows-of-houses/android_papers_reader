@@ -5,6 +5,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -87,13 +88,13 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.papersreader.app.data.db.AnnotationType
 import com.papersreader.app.data.pdf.InlineCitation
-import com.papersreader.app.data.pdf.InlineCitationDetector
 import com.papersreader.app.data.pdf.OutlineEntry
 import com.papersreader.app.data.pdf.ParsedReference
 import com.papersreader.app.data.pdf.PdfTextSelector
@@ -134,9 +135,11 @@ fun ReaderScreen(
     val paperAnnotations by viewModel.paperAnnotations.collectAsState()
     val annotationsByPage = remember(paperAnnotations) { paperAnnotations.groupBy { it.page } }
     val pageWords by viewModel.pageWords.collectAsState()
+    val pageCitations by viewModel.pageCitations.collectAsState()
     val searchState by viewModel.searchState.collectAsState()
 
     var showReferences by remember { mutableStateOf(false) }
+    var showGoToPage by remember { mutableStateOf(false) }
     var showCitedBy by remember { mutableStateOf(false) }
     var showOutline by remember { mutableStateOf(false) }
     var noteDialogAnchor by remember { mutableStateOf<PendingNote?>(null) }
@@ -202,7 +205,9 @@ fun ReaderScreen(
             if (listState.firstVisibleItemIndex < target) delay(100)
         }
         snapshotFlow { listState.firstVisibleItemIndex }
-            .collect { page -> if (page != uiState.currentPage) viewModel.onPageChanged(page, zoom) }
+            .collect { page ->
+                if (page != uiState.currentPage) viewModel.onPageChanged(page, zoom)
+            }
     }
 
     // Restore the zoom the paper was last closed at, once the document has actually loaded.
@@ -234,6 +239,17 @@ fun ReaderScreen(
             panX = 0f
             panY = 0f
             listState.animateScrollToItem(page)
+            // A jump to a page far from the currently visible ones crosses pages that have never
+            // been composed/measured, so animateScrollToItem's own distance estimate is based on
+            // placeholder heights and it can settle well short of the real target — the same
+            // failure mode the initial-page-restore loop above already retries around. Top the
+            // animated scroll off with the same instant-jump retry until the index actually lands.
+            var attempts = 0
+            while (listState.firstVisibleItemIndex != page && attempts < 40) {
+                listState.scrollToItem(page)
+                attempts++
+                if (listState.firstVisibleItemIndex != page) delay(100)
+            }
             viewModel.consumeJumpToPage()
         }
     }
@@ -261,6 +277,7 @@ fun ReaderScreen(
                                 Text(
                                     "${uiState.currentPage + 1} / ${uiState.pageCount}",
                                     style = MaterialTheme.typography.labelSmall,
+                                    modifier = Modifier.clickable { showGoToPage = true },
                                 )
                             }
                         }
@@ -390,6 +407,7 @@ fun ReaderScreen(
                             zoom = zoom,
                             annotations = annotationsByPage[pageIndex] ?: emptyList(),
                             words = pageWords[pageIndex] ?: emptyList(),
+                            citations = pageCitations[pageIndex] ?: emptyList(),
                             searchHighlights = searchState.matches
                                 .filter { it.page == pageIndex }
                                 .flatMap { it.match.words.map(PdfWord::rect) },
@@ -453,6 +471,18 @@ fun ReaderScreen(
                 viewModel.jumpToPage(entry.page)
             },
             onDismiss = { showOutline = false },
+        )
+    }
+
+    if (showGoToPage) {
+        GoToPageDialog(
+            currentPage = uiState.currentPage + 1,
+            pageCount = uiState.pageCount,
+            onGo = { page ->
+                showGoToPage = false
+                viewModel.jumpToPage(page - 1)
+            },
+            onDismiss = { showGoToPage = false },
         )
     }
 
@@ -588,6 +618,7 @@ private fun PageContent(
     zoom: Float,
     annotations: List<Annotation>,
     words: List<PdfWord>,
+    citations: List<InlineCitation>,
     searchHighlights: List<NormalizedRect>,
     activeSearchHighlight: NormalizedRect?,
     drawColor: Color,
@@ -604,7 +635,6 @@ private fun PageContent(
     var containerWidth by remember { mutableStateOf(0) }
     var aspectRatio by remember(pageIndex) { mutableStateOf<Float?>(null) }
     var bitmap by remember(pageIndex, containerWidth) { mutableStateOf<Bitmap?>(null) }
-    val citations = remember(words) { InlineCitationDetector.detect(words) }
 
     LaunchedEffect(pageIndex, containerWidth) {
         if (containerWidth <= 0) return@LaunchedEffect
@@ -747,6 +777,31 @@ private fun OutlineSheet(outline: List<OutlineEntry>, onEntryClick: (OutlineEntr
             }
         }
     }
+}
+
+@Composable
+private fun GoToPageDialog(currentPage: Int, pageCount: Int, onGo: (Int) -> Unit, onDismiss: () -> Unit) {
+    var text by remember { mutableStateOf(currentPage.toString()) }
+    val page = text.toIntOrNull()
+    val valid = page != null && page in 1..pageCount
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Go to page") },
+        text = {
+            TextField(
+                value = text,
+                onValueChange = { text = it.filter(Char::isDigit).take(6) },
+                singleLine = true,
+                label = { Text("Page (1–$pageCount)") },
+                isError = text.isNotEmpty() && !valid,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = { page?.let(onGo) }, enabled = valid) { Text("Go") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 /** "N. Authors. **Title**. Venue..." — bolds the guessed title span so it stands out from the

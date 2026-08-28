@@ -40,6 +40,8 @@ class PdfPageRenderer(file: File) : AutoCloseable {
             renderer.openPage(pageIndex).use { page ->
                 val width = targetWidthPx.coerceAtLeast(1)
                 val height = (width.toFloat() * page.height / page.width).toInt().coerceAtLeast(1)
+                // PdfRenderer.Page.render() requires ARGB_8888 specifically — any other config
+                // throws IllegalArgumentException, so there's no cheaper format to render into.
                 val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
                 bitmap.eraseColor(android.graphics.Color.WHITE)
                 page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)

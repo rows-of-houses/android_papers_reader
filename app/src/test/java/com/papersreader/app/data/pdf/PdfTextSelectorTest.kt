@@ -46,4 +46,34 @@ class PdfTextSelectorTest {
         val text = PdfTextSelector.textFor(words)
         assertEquals("The quick brown\nfox jumps", text)
     }
+
+    // A tall page (real height = 3x real width): one word shares the tap's row but sits far to
+    // the side, the other shares the tap's column but sits several rows below.
+    private val skewedWords = listOf(
+        word("Row", left = 0.1f, top = 0.49f, bottom = 0.51f),
+        word("Col", left = 0.45f, top = 0.65f, bottom = 0.67f),
+    )
+
+    @Test
+    fun `without aspect-ratio correction, a tall page's raw normalized distance picks the wrong word`() {
+        // Tap at (0.5, 0.5): 0.3 normalized units sideways from "Row" (same row, dy=0), and 0.15
+        // normalized units down from "Col" (same column, dx=0). Treating both axes as equally
+        // scaled — as if the page were square — makes the smaller raw vertical gap win, even
+        // though "Col" is several real print-lines below the tap and "Row" is right there.
+        val selected = PdfTextSelector.wordsInRange(skewedWords, fromX = 0.5f, fromY = 0.5f, toX = 0.5f, toY = 0.5f)
+        assertEquals(listOf("Col"), selected.map { it.text })
+    }
+
+    @Test
+    fun `with aspect-ratio correction, the same tap correctly picks the same-row word`() {
+        val selected = PdfTextSelector.wordsInRange(
+            skewedWords,
+            fromX = 0.5f,
+            fromY = 0.5f,
+            toX = 0.5f,
+            toY = 0.5f,
+            pageAspectRatio = 3f,
+        )
+        assertEquals(listOf("Row"), selected.map { it.text })
+    }
 }

@@ -892,7 +892,7 @@ private fun CitedBySheet(
         Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
             Text("Cited by", style = MaterialTheme.typography.titleLarge)
             Text(
-                "Papers that cite this one, found via Semantic Scholar. Tap a title to open it in " +
+                "Papers that cite this one, found via OpenAlex. Tap a title to open it in " +
                     "your browser, or tap the download icon to save an open-access PDF straight to " +
                     "your library and read it right away.",
                 style = MaterialTheme.typography.bodySmall,
@@ -901,7 +901,7 @@ private fun CitedBySheet(
             when {
                 loading -> CircularProgressIndicator(modifier = Modifier.align(Alignment.CenterHorizontally))
                 unavailable -> Column {
-                    Text("Couldn't reach Semantic Scholar right now (it's often just a temporary rate limit) — try again in a moment.")
+                    Text("Couldn't reach OpenAlex right now — try again in a moment.")
                     TextButton(onClick = onRetry, modifier = Modifier.align(Alignment.End)) { Text("Retry") }
                 }
                 citingPapers.isEmpty() -> Text("No citing papers found.")
